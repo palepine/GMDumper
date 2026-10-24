@@ -399,6 +399,66 @@ local function inferGameDataVersion(chunks)
 
 end
 
+--- Recover build-runtime version from compiler-owned STRG paths.
+-- GameMaker's asset compiler may preserve paths beneath Cache/runtimes/runtime-X.Y.Z.B/bin in the string table.
+-- not ultimate though
+-- @param data table
+-- @return table|nil
+-- @return string|nil
+local function readGameDataRuntimePathVersion(data)
+
+  local chunk = data and data.chunks and data.chunks.STRG
+
+  if not chunk or not chunk.size or chunk.size <= 0 or chunk.size > 0x10000000 then return nil end
+
+  local bytes
+
+  if data.embedded and not data.fileBase then return nil end
+
+  local file = io.open( data.path, 'rb' )
+  if not file then return nil end
+
+  file:seek( 'set', (data.fileBase or 0) + chunk.offset )
+
+  bytes = file:read( chunk.size )
+
+  file:close()
+
+  if type(bytes) ~= 'string' or #bytes ~= chunk.size then return nil end
+
+  local versions = {}
+
+  for text in bytes:lower():gmatch('runtimes[\\/]runtime%-(%d+%.%d+%.%d+%.%d+)[\\/]bin[\\/]') do
+    versions[text] = true
+  end
+
+  local selected
+
+  for text in pairs(versions) do
+    
+    if selected and selected ~= text then
+      return nil, 'conflicting runtime build paths in data.win/STRG'
+    end
+
+    selected = text
+  end
+
+  if not selected then return nil end
+
+  local major, minor, release, build = selected:match('^(%d+)%.(%d+)%.(%d+)%.(%d+)$')
+  if not major then return nil end
+
+  return
+  {
+    major = tonumber(major),
+    minor = tonumber(minor),
+    release = tonumber(release),
+    build = tonumber(build),
+    source = 'data.win/STRG-runtime-path',
+    confidence = 'exact-build-runtime'
+  }
+end
+
 --- Read FORM directory and the fixed portion of GEN8
 --- the 4 stored runtime words are useful for GMS1
 -- for modern games chunk features provide a more honest lower bound because GEN8 is commonly frozen
@@ -777,7 +837,23 @@ function Runtime.Discovery.defineVersion(state)
   end
 
   state.gameData = data
-  if data then data.objectNames = readGameDataObjectNames(data) end
+
+  if data then
+
+    data.exact, data.exactError = readGameDataRuntimePathVersion(data)
+
+    if not data.exact and data.embedded and not data.fileBase then
+
+      local fileData = Runtime.Discovery.readEmbeddedGameDataVersion(state)
+
+      if fileData then
+        data.exact, data.exactError = readGameDataRuntimePathVersion(fileData)
+      end
+
+    end
+
+    data.objectNames = readGameDataObjectNames(data)
+  end
 
   local metadata = state.identity.versionMetadata or {}
 
@@ -789,6 +865,12 @@ function Runtime.Discovery.defineVersion(state)
     tostring( metadata.OriginalFilename or '' )
   }
   local metadataText = table.concat( metadataT, ' ' ):lower()
+
+  if metadataText:find('gamemaker studio 2', 1, true) then
+    state.profileHint = 'gms2'
+  elseif metadataText:find('gamemaker studio 1', 1, true) then
+    state.profileHint = 'gms1'
+  end
 
   local executable = parseVersionString( state.identity.fileVersion )
 
@@ -812,15 +894,30 @@ function Runtime.Discovery.defineVersion(state)
     executable.confidence = 'unverified-game-executable'
   end
 
-  -- runner metadata is preferred, then feature lower bounds, then the raw GEN8 value
+  -- runner metadata is normally preferred
   local selected, reason
 
-  if executable and executable.confidence == 'metadata' and (executable.major == 1 or executable.major == 2 or executable.major >= 2022) then
+  local genericGms2Version = state.profileHint == 'gms2'
+                             and executable
+                             and executable.major == 1
+                             and executable.minor == 0
+                             and executable.release == 0
+                             and executable.build == 0
+
+  if executable
+     and executable.confidence == 'metadata'
+     and not genericGms2Version
+     and (executable.major == 1 or executable.major == 2 or executable.major >= 2022)
+  then
     selected, reason = executable, 'executable version resource'
+  elseif data and data.exact then
+    selected, reason = data.exact, 'data.win compiler runtime path'
   elseif data and data.inferred then
     selected, reason = data.inferred, 'data.win feature lower bound'
   elseif data and data.stored then
     selected, reason = data.stored, 'stored GEN8 version'
+  elseif genericGms2Version then
+    selected, reason = executable, 'generic GMS2 executable version resource'
   end
 
   state.version = selected or { major = 0, minor = 0, release = 0, build = 0, source = 'unknown', confidence = 'unknown' }
@@ -1280,9 +1377,19 @@ function Runtime.Discovery.findFunctionTable(state, cancellation)
 
   local minimumCount = state.options.minimumFunctionCount or 32
 
+  local registrationCandidate
+  local registrationAttempted = false
+
   --- Try profiled Function_Add streams in preference order
   -- @return table|nil
   local function registrations()
+
+    if registrationAttempted then
+      return registrationCandidate
+    end
+
+    registrationAttempted = true
+
     for _, layout in ipairs(layouts) do
       if layout.kind ~= 'registration' then goto continue end
 
@@ -1291,9 +1398,10 @@ function Runtime.Discovery.findFunctionTable(state, cancellation)
       if not candidate or #candidate.functions < minimumCount then goto continue end
 
       candidate.score = tableScore(candidate)
-      
-      do -- for label
-        return candidate
+
+      do -- for the label
+        registrationCandidate = candidate
+        return registrationCandidate
       end
 
       ::continue::
@@ -1368,6 +1476,12 @@ function Runtime.Discovery.findFunctionTable(state, cancellation)
     local best = candidates[1]
 
     if best and #best.functions >= minimumCount then
+      local registered = state.pointerSize == 4 and registrations() or nil
+
+      if registered and tableScore(registered) > tableScore(best) then
+        return registered
+      end
+
       best.score = tableScore(best)
       return best
     end
@@ -1386,6 +1500,13 @@ function Runtime.Discovery.findFunctionTable(state, cancellation)
   end
 
   best.score = tableScore(best)
+
+  local registered = state.pointerSize == 4 and registrations() or nil
+
+  if registered and tableScore(registered) > tableScore(best) then
+    return registered
+  end
+
   return best
 end
 
@@ -2928,20 +3049,35 @@ end
 --- Enumerate YYObjectBase RValue storage
 -- Instances may use either a dense m_YYVars array (can be null) or sparse m_YYVarsMap
 local function resolveVariableNames(state, storage)
-  
+  local resolved = storage
   local resolver = state.resolveInstanceVariableNames
+  local authorityAvailable = false
 
-  if type(resolver) ~= 'function' then
-    return storage
+  if type(resolver) == 'function' then
+    local bridgeResolved, resolverError = resolver(storage)
+
+    if bridgeResolved then
+      resolved = bridgeResolved
+      authorityAvailable = true
+    else
+      storage.nameResolutionError = resolverError
+    end
   end
 
-  local resolved, resolverError = resolver(storage)
+  local resolvedCount = 0
 
-  if not resolved then
-    storage.nameResolutionError = resolverError
+  for _, variable in ipairs(resolved.variables or {}) do
+    if variable.name then resolvedCount = resolvedCount + 1 end
   end
 
-  return resolved or storage
+  resolved.resolvedNameCount = resolvedCount
+  resolved.namesAvailable = authorityAvailable and resolvedCount == #(resolved.variables or {})
+
+  if resolved.namesAvailable then
+    resolved.nameResolutionError = nil
+  end
+
+  return resolved
 end
 
 --- Enumerate reflected user variables from (early) GMS1 CInstance
@@ -3400,7 +3536,7 @@ function Runtime.initialize(options, cancellation)
   -- collect version/evidence, select a profile; profile offsets remain vague until validated
   Runtime.Discovery.defineVersion(state)
   
-  state.profile = Versioning.resolve( { version = state.version , pointerSize = state.pointerSize } )
+  state.profile = Versioning.resolve( { version = state.version , pointerSize = state.pointerSize , profileHint = state.profileHint } )
   
   Runtime.Discovery.runnerEvidence( state, cancellation )
 
@@ -3858,7 +3994,7 @@ function Runtime.Dump.objects(state, outputPath, options)
 
             end
 
-            if needsNames and state.resolveInstanceVariableNames then
+            if needsNames then
 
               local named, namedError = Runtime.Instances.listVariablesRaw( state, instance, options.maximumVariables, true, instances )
 

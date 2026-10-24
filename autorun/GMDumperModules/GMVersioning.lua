@@ -188,7 +188,8 @@ end
 -- @param target table
 -- @return table
 function ProfileResolver:resolve(target)
-  local selected = self.specs.base
+
+  local selected = self.specs[ target.profileHint ] or self.specs.base
 
   -- Priority expresses specificity. Overlapping ranges are expected (eg 2024.14+ also matches 2024.6+) and the narrower profile wins.
   for _, spec in pairs(self.specs) do
@@ -222,7 +223,7 @@ local function defineProfiles()
         structuralDiscovery = true,
         namedReflection = true,
         bridgeAutomaticX64 = true,
-        bridgeAutomaticX86 = false,
+        bridgeAutomaticX86 = true,
       },
       layouts =
       {
@@ -447,20 +448,25 @@ local function defineProfiles()
       },
       bridge =
       {
-        -- Offsets are slots in YYRunnerInterface.
-        -- bridge recovers the interface base from assignment code at runtime.
+        -- pointer-slot indexes in YYRunnerInterface
+        -- GMBridge scales them by the target pointer size before native discovery.
         id = 'yy-runner-interface-v1',
+        slotUnit = 'pointer',
         slots =
         {
-          scriptFindId = 0xF0,
-          scriptPerform = 0xF8,
-          structGetMember = 0x2D8,
-          structGetKeys = 0x2E0,
-          arrayGetLength = 0x310,
+          yyGetString = 16,
+          freeRValue = 27,
+          scriptFindId = 30,
+          scriptPerform = 31,
+          structAddRValue = 79,
+          structGetMember = 91,
+          structGetKeys = 92,
+          arrayGetLength = 98,
         },
         discovery =
         {
           minimumAssignments = 88,
+          minimumAssignmentsX86 = 60,
           maximumAssignments = 160,
           maximumSpan = 0x380,
           maximumInstructionSpan = 0x1400,
@@ -484,6 +490,10 @@ local function defineProfiles()
       id = 'gms1',
       extends = 'base',
       priority = 10,
+      capabilities =
+      {
+        bridgeAutomaticX86 = false,
+      },
       match =
       {
         min = { 1, 0 },
@@ -566,8 +576,8 @@ local function defineProfiles()
 
   resolver:register(
     {
-      -- GMS2 version numbering predates the year-based Runtime releases.
-      -- it currently needs no preference changes beyond the generic base profile.
+      -- x86 YYObjectBase contains 2 additional callback pointers before m_YYVarsMap.
+      -- the larger base shifts CInstance::m_Object and the map metadata while CInstanceInternal begins at +0x80
       id = 'gms2',
       extends = 'base',
       priority = 20,
@@ -575,6 +585,23 @@ local function defineProfiles()
       {
         min = { 2, 0 },
         max = { 2, 999 }
+      },
+      layouts =
+      {
+        instances =
+        {
+          x86 =
+          {
+            membersOffsets = { 0x80 },
+            flinkRelatives = { 0xC8 },
+            objectOffset = 0x70,
+            variableMapOffset = 0x2C,
+            variableCountOffset = 0x38,
+            variableCapacityOffset = 0x40,
+            objectFlagsOffset = 0x3C,
+            objectKindOffset = 0x58
+          }
+        }
       }
     }
   )
@@ -717,6 +744,7 @@ function Versioning.resolve(target)
     result.bridge.automatic = result.capabilities.bridgeAutomaticX64 == true
   else
     result.bridge.automatic = result.capabilities.bridgeAutomaticX86 == true
+    result.bridge.discovery.minimumAssignments = result.bridge.discovery.minimumAssignmentsX86
   end
 
   return result

@@ -17,7 +17,21 @@ local Bridge =
 {
   ABI = 1,
   VERSION = 0x00010000,
-  ATTACHMENT_NAME = 'GMDumper.GMDumperBridge.dll',
+  BINARIES =
+  {
+    [4] =
+    {
+      attachment = 'GMDumper.GMDumperBridge.x86.dll',
+      file = 'GMDumperBridge.x86.dll',
+      architecture = 'x86'
+    },
+    [8] =
+    {
+      attachment = 'GMDumper.GMDumperBridge.x64.dll',
+      file = 'GMDumperBridge.x64.dll',
+      architecture = 'x64'
+    }
+  },
   MEMBER_SIZE = 272,
   Status =
   {
@@ -46,10 +60,12 @@ local EXPORTS =
 {
   'gmd_bridge_version',
   'gmd_bridge_abi',
+  'gmd_bridge_pointer_size',
   'gmd_configure_dispatcher',
   'gmd_configure_discovery_profile',
   'gmd_discover_reflection',
   'gmd_configure_reflection',
+  'gmd_configure_member_fallback',
   'gmd_configure_array_access',
   'gmd_configure_script_execute',
   'gmd_get_struct_get_keys',
@@ -73,6 +89,20 @@ local EXPORTS =
   'gmd_get_last_error'
 }
 
+--- Interpret uint32 as int32
+-- @param value number|nil
+-- @return number|nil
+local function signedInteger(value) -- TODO: replace with CE APIs
+
+  if value == nil then return nil end
+
+  value = value & 0xFFFFFFFF
+
+  if value >= 0x80000000 then return value - 0x100000000 end
+
+  return value
+end
+
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--/// LOADING & CONFIGURATION
 
 --- Invoke bridge export via executeCodeEx
@@ -90,34 +120,133 @@ local function call(address, ...)
     }
   end
 
-  local ok, result = pcall( executeCodeEx, 0, 10000, address, table.unpack(arguments) )
-  if not ok then
-    return nil, tostring(result)
+  -- Bridge exports use the C ABI: cdecl on x86, the unified Windows ABI on x64.
+  local callMethod = Bridge.State.callMethod or 0
+
+  local ok, result = pcall( executeCodeEx, callMethod, 10000, address, table.unpack(arguments) )
+
+  if not ok then return nil, tostring(result) end
+
+  return result
+end
+
+--- Read bridge PE export
+-- @param module table @ enumModules() entry
+-- @return table|nil @ export name -> target address
+-- @return string|nil
+local function readModuleExports(module)
+  
+  local base = module and module.Address
+
+  if not base then return nil, 'Bridge module has no base address' end
+  if readSmallInteger(base) ~= 0x5A4D then return nil, 'Bridge module has no DOS header' end
+
+  local peOffset = readInteger( base + 0x3C )
+  if not peOffset or peOffset < 0x40 or peOffset > 0x100000 then return nil, 'Bridge module has invalid PE offset' end
+
+  local nt = base + peOffset
+  if readInteger(nt) ~= 0x00004550 then return nil, 'Bridge module has no PE header' end
+
+  local optional = nt + 0x18
+  local magic = readSmallInteger( optional )
+  local dataDirectoryOffset
+
+  if magic == 0x10B then
+    dataDirectoryOffset = 0x60
+  elseif magic == 0x20B then
+    dataDirectoryOffset = 0x70
+  else
+    return nil, ('Bridge module has unsupported optional-header magic: 0x%X'):format( magic or 0 )
+  end
+
+  local exportRva = readInteger( optional + dataDirectoryOffset )
+  local exportSize = readInteger( optional + dataDirectoryOffset + 4 )
+
+  if not exportRva or exportRva == 0 or not exportSize or exportSize == 0 then return nil, 'Bridge module has no export directory' end
+
+  local directory = base + exportRva
+  local functionCount = readInteger( directory + 0x14 )
+  local nameCount = readInteger( directory + 0x18 )
+  local functionsRva = readInteger( directory + 0x1C )
+  local namesRva = readInteger( directory + 0x20 )
+  local ordinalsRva = readInteger( directory + 0x24 )
+
+  if not functionCount or functionCount <= 0
+     or not nameCount or nameCount <= 0
+     or not functionsRva or functionsRva == 0
+     or not namesRva or namesRva == 0
+     or not ordinalsRva or ordinalsRva == 0 then
+    return nil, 'Bridge export directory is incomplete'
+  end
+
+  -- The bridge has only a few dozen exports.  A defensive bound prevents a
+  -- malformed directory from turning initialization into a long memory walk.
+  if nameCount > 4096 or functionCount > 4096 then return nil, 'Bridge export directory is implausibly large' end
+
+  local result = {}
+
+  for index = 0, nameCount - 1 do
+    local nameRva = readInteger( base + namesRva + index * 4 )
+    local ordinal = readSmallInteger( base + ordinalsRva + index * 2 )
+
+    if nameRva and nameRva ~= 0 and ordinal and ordinal < functionCount then
+      local name = readString( base + nameRva, 256, false )
+      local functionRva = readInteger( base + functionsRva + ordinal * 4 )
+
+      if name and name ~= '' and functionRva and functionRva ~= 0 then
+        
+        -- forwarded exports point back into the export directory.
+        if functionRva < exportRva or functionRva >= exportRva + exportSize then
+          result[name] = base + functionRva
+        end
+
+      end
+
+    end
+
   end
 
   return result
 end
 
---- Resolve export
--- @param name string
-local function resolveExport(name)
-  return getAddressSafe('GMDumperBridge.' .. name)
-      or getAddressSafe('GMDumperBridge.dll.' .. name)
-      or getAddressSafe(name)
-end
+--- Resolve every required bridge export from one exact module image
+-- @param module table
+local function resolveExports(module)
+  local available, exportError = readModuleExports(module)
+  if not available then return nil, exportError end
 
---- Resolve exports
-local function resolveExports()
   local result = {}
 
   for _, name in ipairs(EXPORTS) do
-
-    result[name] = resolveExport(name)
+    result[name] = available[name]
 
     if not result[name] then return nil, 'Bridge export wasnt resolved: ' .. name end
   end
 
   return result
+end
+
+--- Find loaded bridge module for the target arch
+-- @param pointerSize number
+local function loadedBridgeModule(pointerSize)
+  
+  local binary = Bridge.BINARIES[ pointerSize ]
+
+  local architecturePrefix = ('GMDumperBridge_%s_'):format(binary.architecture):lower()
+
+  local installedName = binary.file:lower()
+
+  for _, module in ipairs(enumModules() or {}) do
+
+    local fileName = extractFileName( module.PathToFile or '' )
+    local lowered = tostring(fileName or ''):lower()
+
+    if lowered == installedName or lowered:sub(1, #architecturePrefix) == architecturePrefix then
+      return module
+    end
+
+  end
+
 end
 
 --- local bridge path readable?
@@ -150,10 +279,14 @@ end
 -- @param processId number
 -- @return string|nil @ extracted path; nil when no attachment exists
 -- @return string|nil @ validation or filesystem error
-local function extractAttachedBridge(processId)
+local function extractAttachedBridge(processId, pointerSize)
+  
   local function extract()
 
-    local tableFile = findTableFile( Bridge.ATTACHMENT_NAME )
+    local binary = Bridge.BINARIES[pointerSize]
+    if not binary then return nil, 'Unsupported target pointer size: ' .. tostring(pointerSize) end
+
+    local tableFile = findTableFile( binary.attachment )
     if not tableFile then return nil end
 
     local stream = tableFile.getData()
@@ -179,7 +312,9 @@ local function extractAttachedBridge(processId)
     Bridge.State.extractionSerial = (Bridge.State.extractionSerial or 0) + 1
 
     local separator = temporaryDirectory:sub(-1) == '\\' and '' or '\\'
-    local temporaryPath = temporaryDirectory .. separator .. ('GMDumperBridge-abi%d-%d-%d-%d.dll'):format( Bridge.ABI, processId, os.time(), Bridge.State.extractionSerial )
+    local temporaryPath = temporaryDirectory
+                          .. separator
+                          .. ('GMDumperBridge_%s_abi%d_%d_%d_%d.dll'):format( binary.architecture, Bridge.ABI, processId, os.time(), Bridge.State.extractionSerial )
 
     stream.Position = 0
 
@@ -198,9 +333,15 @@ end
 
 --- Load/reconnect the bridge into the process
 -- @param path string
-function Bridge.load(path)
+-- @param pointerSize number
+function Bridge.load(path, pointerSize)
   local processId = getOpenedProcessID()
   if not processId or processId == 0 then return nil, 'No target is attached' end
+
+  pointerSize = tonumber(pointerSize)
+  if pointerSize ~= 4 and pointerSize ~= 8 then return nil, 'Target pointer size must be 4 or 8' end
+
+  local binary = Bridge.BINARIES[pointerSize]
 
   -- discard after process changes
   if Bridge.State.processId ~= processId then
@@ -215,21 +356,35 @@ function Bridge.load(path)
       path = nil,
       configured = false,
       profileId = nil,
+      pointerSize = pointerSize,
+      callMethod = pointerSize == 4 and 1 or 0,
       extractedPath = nil,
       extractionSerial = extractionSerial
     }
   end
 
-  if Bridge.State.exports then return true end
+  if Bridge.State.exports then
+    if Bridge.State.pointerSize ~= pointerSize then return nil, 'Loaded bridge architecture doesnt match the target' end
+    return true
+  end
+
+
+  Bridge.State.callMethod = pointerSize == 4 and 1 or 0
 
   -- reconnect first
-  local exports = resolveExports()
+  local loadedModule = loadedBridgeModule( pointerSize )
+  local exports, exportError
+
+  if loadedModule then
+    exports, exportError = resolveExports( loadedModule )
+  end
+
   local temporaryPath
 
   if not path and not exports then
     local attachmentError
 
-    path, attachmentError = extractAttachedBridge(processId)
+    path, attachmentError = extractAttachedBridge(processId, pointerSize)
     if attachmentError then return nil, attachmentError end
 
     if path then
@@ -238,7 +393,7 @@ function Bridge.load(path)
     end
   end
 
-  path = path or (MODULE_DIRECTORY .. 'GMDumperBridge.dll')
+  path = path or (MODULE_DIRECTORY .. binary.file)
 
   if not exports then
 
@@ -254,12 +409,18 @@ function Bridge.load(path)
       return nil, 'Couldnt inject the bridge: ' .. tostring(injected)
     end
 
-    exports = resolveExports()
+    loadedModule = loadedBridgeModule(pointerSize)
+
+    if loadedModule then
+      exports, exportError = resolveExports(loadedModule)
+    else
+      exportError = 'Injected bridge module wasnt returned by enumModules()'
+    end
   end
 
   if not exports then
     discardTemporaryBridge(temporaryPath)
-    return nil, 'Bridge injected, but exports werent resolved'
+    return nil, 'Bridge injected, but exports werent resolved: ' .. tostring(exportError or 'unknown error')
   end
   
   -- check abi version
@@ -269,6 +430,13 @@ function Bridge.load(path)
     return nil, ('Bridge ABI mismatch: Lua expects %d, DLL provides %s'):format( Bridge.ABI, tostring(abi) )
   end
 
+  local bridgePointerSize = call( exports.gmd_bridge_pointer_size )
+
+  if bridgePointerSize ~= pointerSize then
+    discardTemporaryBridge(temporaryPath)
+    return nil, ('Bridge architecture mismatch: target uses %d-byte pointers, DLL uses %s'):format( pointerSize, tostring(bridgePointerSize) )
+  end
+
   local version = call( exports.gmd_bridge_version )
   
   if not version or version < Bridge.VERSION then
@@ -276,7 +444,7 @@ function Bridge.load(path)
     return nil, ('Bridge is stale (need 0x%08X, loaded 0x%08X); restart to unload'):format( Bridge.VERSION, tonumber(version) or 0 )
   end
 
-  Bridge.State.exports, Bridge.State.path = exports, path
+  Bridge.State.exports, Bridge.State.path, Bridge.State.pointerSize = exports, path, pointerSize
 
   -- the loaded module no longer needs its source file
   discardTemporaryBridge(temporaryPath)
@@ -316,22 +484,29 @@ end
 -- @param arrayLength any
 -- @param scriptExecute any
 -- @param profile table
-function Bridge.configure(codeExecute, reflection, arrayEquals, arrayLength, scriptExecute, profile)
+-- @param pointerSize number
+-- @param memberGetNames any
+-- @param memberNamesCount any
+function Bridge.configure(codeExecute, reflection, arrayEquals, arrayLength, scriptExecute, profile, pointerSize, memberGetNames, memberNamesCount)
   
-  local loaded, loadError = Bridge.load()
+  local loaded, loadError = Bridge.load( nil, pointerSize )
   if not loaded then return nil, loadError end
 
   profile = profile or
   {
     id = 'yy-runner-interface-v1',
     automatic = true,
+    slotUnit = 'pointer',
     slots =
     {
-      scriptFindId = 0xF0,
-      scriptPerform = 0xF8,
-      structGetMember = 0x2D8,
-      structGetKeys = 0x2E0,
-      arrayGetLength = 0x310
+      yyGetString = 16,
+      freeRValue = 27,
+      scriptFindId = 30,
+      scriptPerform = 31,
+      structAddRValue = 79,
+      structGetMember = 91,
+      structGetKeys = 92,
+      arrayGetLength = 98
     },
 
     discovery =
@@ -346,14 +521,24 @@ function Bridge.configure(codeExecute, reflection, arrayEquals, arrayLength, scr
   }
   local slots, discovery = profile.slots or {}, profile.discovery or {}
 
+  --- Convert a profile slot to arch-specific byte offset
+  -- @param value number
+  local function slotOffset(value)
+    if type(value) ~= 'number' then return nil end
+    return profile.slotUnit == 'pointer' and value * pointerSize or value
+  end
+
   -- send slot offsets & bounds before interpreting
   if Bridge.call(
                   'gmd_configure_discovery_profile',
-                   slots.scriptFindId,
-                   slots.scriptPerform,
-                   slots.structGetMember,
-                   slots.structGetKeys,
-                   slots.arrayGetLength,
+                   slotOffset( slots.yyGetString ),
+                   slotOffset( slots.freeRValue ),
+                   slotOffset( slots.scriptFindId ),
+                   slotOffset( slots.scriptPerform ),
+                   slotOffset( slots.structAddRValue ),
+                   slotOffset( slots.structGetMember ),
+                   slotOffset( slots.structGetKeys ),
+                   slotOffset( slots.arrayGetLength ),
                    discovery.minimumAssignments,
                    discovery.maximumAssignments,
                    discovery.maximumSpan,
@@ -375,6 +560,31 @@ function Bridge.configure(codeExecute, reflection, arrayEquals, arrayLength, scr
   
   elseif Bridge.call( 'gmd_discover_reflection' ) ~= 1 then
     return nil, Bridge.lastError()
+  end
+
+  local directKeys = Bridge.call( 'gmd_get_struct_get_keys' )
+  local directMember = Bridge.call( 'gmd_get_struct_get_member' )
+  local directAvailable = directKeys and directKeys ~= 0 and directMember and directMember ~= 0
+
+  Bridge.State.memberFallbackConfigured = false
+  Bridge.State.memberFallbackError = nil
+
+  -- configure the built-in path even when direct interface entries were discovered.
+  -- old runner interfaces can have executable functions at the newer StructGetMember/StructGetKeys slot numbers
+  -- runtime invocation reveals that they are not reflection functions.
+  -- The bridge falls back on the game thread when that probe returns zero / fails validation.
+  if memberGetNames and memberNamesCount then
+
+    if Bridge.call( 'gmd_configure_member_fallback', memberGetNames, memberNamesCount ) == 1 then
+      Bridge.State.memberFallbackConfigured = true
+    else
+      Bridge.State.memberFallbackError = Bridge.lastError()
+    end
+
+  end
+
+  if not directAvailable and not Bridge.State.memberFallbackConfigured then
+    return nil, Bridge.State.memberFallbackError or 'Runner lacks direct reflection & member-name built-ins'
   end
 
   -- install dispatcher after reflection is available
@@ -401,24 +611,39 @@ end
 
 --- Get recovered bridge capabilities and runner addresses
 function Bridge.status()
-  local arrayStorageOffset = Bridge.State.exports and Bridge.call('gmd_get_array_storage_offset') or nil
+  local arrayStorageOffset = Bridge.State.exports and Bridge.call( 'gmd_get_array_storage_offset' ) or nil
+  local structGetKeys = Bridge.State.exports and Bridge.call( 'gmd_get_struct_get_keys' ) or nil
+  local structGetMember = Bridge.State.exports and Bridge.call( 'gmd_get_struct_get_member' ) or nil
 
   return
   {
     loaded = Bridge.State.exports ~= nil,
     configured = Bridge.State.configured,
+    pointerSize = Bridge.State.pointerSize,
     profileId = Bridge.State.profileId,
     path = Bridge.State.path,
-    structGetKeys = Bridge.State.exports and Bridge.call('gmd_get_struct_get_keys') or nil,
-    structGetMember = Bridge.State.exports and Bridge.call('gmd_get_struct_get_member') or nil,
-    scriptFindId = Bridge.State.exports and Bridge.call('gmd_get_script_find_id') or nil,
-    scriptPerform = Bridge.State.exports and Bridge.call('gmd_get_script_perform') or nil,
-    arrayLength = Bridge.State.exports and Bridge.call('gmd_get_array_length') or nil,
+    reflectionMode = Bridge.State.configured
+                     and structGetKeys
+                     and structGetKeys ~= 0
+                     and structGetMember
+                     and structGetMember ~= 0
+                     and (Bridge.State.memberFallbackConfigured and 'direct+builtin-fallback' or 'direct')
+                     or Bridge.State.configured
+                     and Bridge.State.memberFallbackConfigured
+                     and 'builtin-slot'
+                     or nil,
+    memberFallbackConfigured = Bridge.State.memberFallbackConfigured == true,
+    memberFallbackError = Bridge.State.memberFallbackError,
+    structGetKeys = structGetKeys,
+    structGetMember = structGetMember,
+    scriptFindId = Bridge.State.exports and Bridge.call( 'gmd_get_script_find_id' ) or nil,
+    scriptPerform = Bridge.State.exports and Bridge.call( 'gmd_get_script_perform' ) or nil,
+    arrayLength = Bridge.State.exports and Bridge.call( 'gmd_get_array_length' ) or nil,
     arrayLengthRoutine = Bridge.State.arrayLengthRoutine,
     arrayStorageOffset = arrayStorageOffset,
     arrayError = type(arrayStorageOffset) == 'number' and arrayStorageOffset >= 0 and arrayStorageOffset <= 0x100 and nil or Bridge.State.arrayError,
     scriptError = Bridge.State.scriptError,
-    schedulerThreadId = Bridge.State.exports and Bridge.call('gmd_get_scheduler_thread_id') or nil
+    schedulerThreadId = Bridge.State.exports and Bridge.call( 'gmd_get_scheduler_thread_id' ) or nil
   }
 end
 
@@ -488,8 +713,9 @@ local function copyMemberRecords(handle, includeIndex)
 
     local record =
     {
-      address = readQword(entry),
-      kind = readInteger(entry + 8),
+      address = readQword( entry ),
+      kind = signedInteger( readInteger(entry + 8) ),
+      slot = signedInteger( readInteger(entry + 12) ),
     }
 
     if includeIndex then
@@ -772,29 +998,71 @@ function Bridge.annotateStorage(storage, maximum, timeout)
   if not members then return nil, memberError end
 
   local byAddress = {}
+  local bySlot = {}
+  local byName = {}
 
   for _, member in ipairs(members) do
 
-    if member.address and member.address ~= 0 then
+    if type(member.name) ~= 'string' or member.name == '' then return nil, 'bridge returned an empty member name' end
+    
+    if (not member.address or member.address == 0) and (not member.slot or member.slot < 0) then
+      return nil, 'bridge returned neither an address nor a runtime slot for ' .. member.name
+    end
+
+    local hasAddress = member.address and member.address ~= 0
+
+    if hasAddress then
+
+      local previousAddress = byAddress[ member.address ]
+
+      if previousAddress and previousAddress.name ~= member.name then return nil, 'bridge returned conflicting names for one RValue address' end
+
       byAddress[ member.address ] = member
     end
+
+    if not hasAddress and member.slot and member.slot >= 0 then
+
+      local previousSlot = bySlot[ member.slot ]
+
+      if previousSlot and previousSlot.name ~= member.name then return nil, 'bridge returned conflicting names for one runtime slot' end
+
+      bySlot[ member.slot ] = member
+    end
+
+    local previousName = byName[ member.name ]
+
+    if previousName and previousName.address ~= member.address and previousName.slot ~= member.slot then
+      return nil, 'bridge returned duplicate member name at different locations: ' .. member.name
+    end
+
+    byName[ member.name ] = member
 
   end
 
   local resolved = 0
+  local assignments = {}
 
   for _, variable in ipairs( storage.variables ) do
 
-    local member = byAddress[ variable.address ]
+    local member = byAddress[ variable.address ] or bySlot[ variable.slot ]
     
     if member then
-      variable.name = member.name
+      
+      if variable.kind ~= nil and member.kind ~= nil and member.kind >= 0 and variable.kind ~= member.kind then
+        return nil, ('bridge/raw RValue kind mismatch for %s at %X'):format( member.name, variable.address )
+      end
+
+      assignments[variable] = member.name
       resolved = resolved + 1
     end
 
   end
 
-  if #storage.variables > 0 and resolved == 0 then return nil, ('bridge returned %d named members; none matched enumerated RValue addrs'):format(#members) end
+  if resolved ~= #storage.variables then
+    return nil, ('bridge resolved %d/%d enumerated RValue addresses (%d reflected members)'):format( resolved, #storage.variables, #members )
+  end
+
+  for variable, name in pairs(assignments) do variable.name = name end
   
   storage.namesAvailable = true
   storage.bridgeMemberCount = #members

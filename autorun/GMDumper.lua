@@ -24,6 +24,19 @@
   You should have received a copy of the GNU Affero General Public License
   along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+  UndertaleModTool
+  Copyright (C) UnderminersTeam
+
+  This program is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
 ]]
 
 -- TODO: add namespaces for gm_watchObjectFields?
@@ -51,8 +64,10 @@ local PORTABLE_FILES =
   { name = 'GMDumper.GMRuntime',           path = [[autorun\GMDumperModules\GMRuntime.lua]] },
   { name = 'GMDumper.GMVersioning',        path = [[autorun\GMDumperModules\GMVersioning.lua]] },
   { name = 'GMDumper.GMBridge',            path = [[autorun\GMDumperModules\GMBridge.lua]] },
-  { name = 'GMDumper.GMDumperBridge.dll',  path = [[autorun\GMDumperModules\GMDumperBridge.dll]],
-    -- optional = true,
+  { name = 'GMDumper.GMDumperBridge.x86.dll',  path = [[autorun\GMDumperModules\GMDumperBridge.x86.dll]],
+    binary = true,
+  },
+  { name = 'GMDumper.GMDumperBridge.x64.dll',  path = [[autorun\GMDumperModules\GMDumperBridge.x64.dll]],
     binary = true,
   },
 }
@@ -432,11 +447,12 @@ function GM.API.gm_initDumper(overrides) -- TODO: export to functions
   state.log = GM.State.log
   GM.State.lastError = nil
 
-  -- x86/GMS1 can still enumerate & reflect fields through its native registry
-  local bridgeArchitectureError = state.pointerSize ~= 8 and 'No support for 32 bit (native bridge)' or nil
-  state.bridge = { available = false , error = bridgeArchitectureError or bridgeLoadError }
+  local bridgeProfileError = state.profile.bridge.automatic == false and ('Bridge auto-discovery isnt available for profile ' .. state.profile.id) or nil
+  state.bridge = { available = false , error = bridgeLoadError or bridgeProfileError }
 
-  if configured.bridge ~= false and not bridgeArchitectureError and state.codeExecute and Bridge then
+  local manualReflection = configured.structGetKeys and configured.structGetMember
+
+  if configured.bridge ~= false and (state.profile.bridge.automatic ~= false or manualReflection) and state.codeExecute and Bridge then
     
     -- Nil normally, bridge discovers the ABI, otherwise manually
     local reflection = configured.structGetKeys
@@ -447,6 +463,8 @@ function GM.API.gm_initDumper(overrides) -- TODO: export to functions
     local arrayEquals = Runtime.Reflection.findFunction( state, 'array_equals' )
     local arrayLength = Runtime.Reflection.findFunction( state, 'array_length' )
     local scriptExecute = Runtime.Reflection.findFunction( state, 'script_execute' )
+    local memberGetNames = Runtime.Reflection.findFunction( state, 'variable_instance_get_names' ) or Runtime.Reflection.findFunction( state, 'variable_struct_get_names' )
+    local memberNamesCount = Runtime.Reflection.findFunction( state, 'variable_instance_names_count' ) or Runtime.Reflection.findFunction( state, 'variable_struct_names_count' )
 
     local bridgeState, bridgeError = Bridge.configure(
                                                         state.codeExecute,
@@ -454,7 +472,10 @@ function GM.API.gm_initDumper(overrides) -- TODO: export to functions
                                                         arrayEquals and arrayEquals.routine,
                                                         arrayLength and arrayLength.routine,
                                                         scriptExecute and scriptExecute.routine,
-                                                        state.profile.bridge
+                                                        state.profile.bridge,
+                                                        state.pointerSize,
+                                                        memberGetNames and memberGetNames.routine,
+                                                        memberNamesCount and memberNamesCount.routine
                                                       )
     
     if bridgeState then
@@ -525,6 +546,27 @@ end
 function GM.API.gm_getStatus()
   local state = GM.State.runtime
   local instances = state and state.instances
+  local namedReflection = state
+                          and ( state.bridge
+                                and state.bridge.available == true
+                                or instances
+                                and instances.variableReflection
+                                and instances.variableReflection.available == true
+                              )
+                          or false
+
+  local reflectionError
+
+  if not namedReflection then
+
+    reflectionError = instances
+                      and instances.variableReflectionError
+                      or state
+                      and state.bridge
+                      and state.bridge.error
+                      or nil
+  end
+
   return
   {
     ready = state and state.ready == true or false,
@@ -543,14 +585,8 @@ function GM.API.gm_getStatus()
     globalsError = state and state.globals and state.globals.error or instances and instances.globalStorageError or nil,
     instanceCount = instances and instances.list and instances.list.count or 0,
     instanceError = instances and instances.error or nil,
-    namedReflection = state
-                      and ( state.bridge and state.bridge.available == true or instances and instances.variableReflection and instances.variableReflection.available == true )
-                      or false,
-
-    reflectionError = instances
-                      and instances.variableReflectionError
-                      or not (instances and instances.variableReflection and instances.variableReflection.available == true)
-                      and state and state.bridge and state.bridge.error or nil,
+    namedReflection = namedReflection,
+    reflectionError = reflectionError,
 
     bridgeError = state and state.bridge and state.bridge.error or nil,
   }
@@ -616,12 +652,13 @@ end
 function GM.API.gm_configureBridge(reflection)
   local state = ensureReady()
 
-  if state.pointerSize ~= 8 then return nil, 'No support for 32 bit (native bridge)' end
   if not Bridge then return nil, bridgeLoadError or 'Bridge client is unavailable' end
 
   local arrayEquals = Runtime.Reflection.findFunction( state, 'array_equals' )
   local arrayLength = Runtime.Reflection.findFunction( state, 'array_length' )
   local scriptExecute = Runtime.Reflection.findFunction( state, 'script_execute' )
+  local memberGetNames = Runtime.Reflection.findFunction( state, 'variable_instance_get_names' ) or Runtime.Reflection.findFunction( state, 'variable_struct_get_names' )
+  local memberNamesCount = Runtime.Reflection.findFunction( state, 'variable_instance_names_count' ) or Runtime.Reflection.findFunction( state, 'variable_struct_names_count' )
 
   local status, bridgeError = Bridge.configure(
                                                 state.codeExecute,
@@ -629,7 +666,10 @@ function GM.API.gm_configureBridge(reflection)
                                                 arrayEquals and arrayEquals.routine,
                                                 arrayLength and arrayLength.routine,
                                                 scriptExecute and scriptExecute.routine,
-                                                state.profile.bridge
+                                                state.profile.bridge,
+                                                state.pointerSize,
+                                                memberGetNames and memberGetNames.routine,
+                                                memberNamesCount and memberNamesCount.routine
                                               )
 
   if not status then

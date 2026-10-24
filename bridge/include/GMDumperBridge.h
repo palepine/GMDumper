@@ -9,9 +9,13 @@
 #include <cstdint>
 
 #if defined(GMDUMPER_BRIDGE_EXPORTS)
+
 #define GMD_API extern "C" __declspec(dllexport)
+
 #else
+
 #define GMD_API extern "C" __declspec(dllimport)
+
 #endif
 
 enum class GmdRequestStatus : std::uint32_t
@@ -30,7 +34,7 @@ struct GmdMemberRecord
 {
   std::uint64_t address;
   std::int32_t kind;
-  std::uint32_t reserved;
+  std::int32_t slot; ///< Runtime variable slot or -1 when address reflection was used.
   char name[256];
 };
 
@@ -47,15 +51,21 @@ GMD_API std::uint32_t gmd_bridge_version();
 /// Return the public ABI generation.
 GMD_API std::uint32_t gmd_bridge_abi();
 
+/// Return the pointer size of the injected bridge process.
+GMD_API std::uint32_t gmd_bridge_pointer_size();
+
 /// Install the Code_Execute detour that schedules queued work on the runner thread.
-GMD_API std::uint32_t gmd_configure_dispatcher(void *code_execute);
+GMD_API std::uint32_t gmd_configure_dispatcher(void* code_execute);
 
 /// Configure YYRunnerInterface slot offsets and discovery validation limits.
 ///
 /// These values reorder/constrain discovery; they do not bypass validation.
 GMD_API std::uint32_t gmd_configure_discovery_profile(
+                                                        std::uint32_t yy_get_string_offset,
+                                                        std::uint32_t free_rvalue_offset,
                                                         std::uint32_t script_find_id_offset,
                                                         std::uint32_t script_perform_offset,
+                                                        std::uint32_t struct_add_rvalue_offset,
                                                         std::uint32_t struct_get_member_offset,
                                                         std::uint32_t struct_get_keys_offset,
                                                         std::uint32_t array_get_length_offset,
@@ -71,16 +81,22 @@ GMD_API std::uint32_t gmd_configure_discovery_profile(
 GMD_API std::uint32_t gmd_discover_reflection();
 
 /// Discover runner-interface functions in an explicitly supplied module.
-GMD_API std::uint32_t gmd_discover_reflection_at(void *module);
+GMD_API std::uint32_t gmd_discover_reflection_at(void* module);
 
 /// Use caller-validated reflection functions instead of automatic discovery.
-GMD_API std::uint32_t gmd_configure_reflection(void *struct_get_keys, void *struct_get_member);
+GMD_API std::uint32_t gmd_configure_reflection(void* struct_get_keys, void* struct_get_member);
+
+/// Configure built-in member-name enumeration used by older interfaces.
+///
+/// Names are converted to runtime slots through the bridge-discovered Code_Variable_FindAlloc_Slot_From_Name routine.
+/// retained as a validation fallback when older interface has unrelated executable functions at newer reflection slot offsets.
+GMD_API std::uint32_t gmd_configure_member_fallback(void* get_names, void* names_count);
 
 /// Configure array helpers and infer DynamicArrayOfRValue element storage.
-GMD_API std::uint32_t gmd_configure_array_access(void *array_equals, void *array_length);
+GMD_API std::uint32_t gmd_configure_array_access(void* array_equals, void* array_length);
 
 /// Configure the optional script_execute built-in used for GML calls.
-GMD_API std::uint32_t gmd_configure_script_execute(void *script_execute);
+GMD_API std::uint32_t gmd_configure_script_execute(void* script_execute);
 
 /// Return the discovered StructGetKeys address, or zero.
 GMD_API std::uint64_t gmd_get_struct_get_keys();
@@ -104,37 +120,37 @@ GMD_API std::int64_t gmd_get_array_storage_offset();
 GMD_API std::uint32_t gmd_get_scheduler_thread_id();
 
 /// Queue reflected-member enumeration for one YYObjectBase pointer.
-GMD_API void *gmd_queue_members(void *object, std::uint32_t maximum);
+GMD_API void* gmd_queue_members(void* object, std::uint32_t maximum);
 
 /// Queue element enumeration for one live array RValue.
-GMD_API void *gmd_queue_array(GmdRValue *array, std::uint32_t maximum);
+GMD_API void* gmd_queue_array(GmdRValue* array, std::uint32_t maximum);
 
 /// Queue one user-defined GML function call.
-GMD_API void *gmd_queue_script(const char *name, void *self, void *other, const GmdRValue *arguments, std::uint32_t argument_count);
+GMD_API void* gmd_queue_script(const char* name, void* self, void* other, const GmdRValue* arguments, std::uint32_t argument_count);
 
 /// Queue one already-resolved runner routine.
-GMD_API void *gmd_queue_routine(void *routine, void *self, void *other, const GmdRValue *arguments, std::uint32_t argument_count);
+GMD_API void* gmd_queue_routine(void* routine, void* self, void* other, const GmdRValue* arguments, std::uint32_t argument_count);
 
 /// Read an opaque request's GmdRequestStatus value.
-GMD_API std::uint32_t gmd_get_request_status(void *handle);
+GMD_API std::uint32_t gmd_get_request_status(void* handle);
 
 /// Return the number of completed member/array records.
-GMD_API std::uint32_t gmd_get_member_count(void *handle);
+GMD_API std::uint32_t gmd_get_member_count(void* handle);
 
 /// Copy completed member/array records to a caller-owned buffer.
-GMD_API std::uint32_t gmd_copy_members(void *handle, GmdMemberRecord *destination, std::uint32_t capacity);
+GMD_API std::uint32_t gmd_copy_members(void* handle, GmdMemberRecord* destination, std::uint32_t capacity);
 
 /// Copy a completed script-call result to a caller-owned buffer.
-GMD_API std::uint32_t gmd_copy_call_result(void *handle, GmdRValue *destination);
+GMD_API std::uint32_t gmd_copy_call_result(void* handle, GmdRValue* destination);
 
 /// Cancel a request that has not started running.
-GMD_API std::uint32_t gmd_cancel_request(void *handle);
+GMD_API std::uint32_t gmd_cancel_request(void* handle);
 
 /// Destroy a terminal request and invalidate its handle.
-GMD_API std::uint32_t gmd_release_request(void *handle);
+GMD_API std::uint32_t gmd_release_request(void* handle);
 
 /// Remove the dispatcher after all requests and callbacks become idle.
 GMD_API std::uint32_t gmd_remove_dispatcher();
 
 /// Copy the last diagnostic and return the required NUL-terminated buffer size.
-GMD_API std::uint32_t gmd_get_last_error(char *buffer, std::uint32_t capacity);
+GMD_API std::uint32_t gmd_get_last_error(char* buffer, std::uint32_t capacity);

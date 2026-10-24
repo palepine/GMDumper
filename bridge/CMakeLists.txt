@@ -4,6 +4,16 @@ project( GMDumperBridge LANGUAGES C CXX )
 
 include(FetchContent)
 
+option( GMDUMPER_BUILD_DISCOVERY_PROBE "Build the offline runner-interface discovery probe" OFF )
+
+if(MSVC)
+  
+  # Every static dependency must use the same CRT as the injected DLL
+  # A mixed /MD & /MT x86 link pulls incompatible exception-handler support.
+  set( CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" )
+
+endif()
+
 if(NOT WIN32)
   message( FATAL_ERROR "GMDumperBridge supports Windows targets only" )
 endif()
@@ -74,8 +84,36 @@ if(MSVC)
                                                   /EHsc
                         )
 
-  set_property( TARGET GMDumperBridge PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" )
-
   endif()
 
-set_target_properties( GMDumperBridge PROPERTIES OUTPUT_NAME "GMDumperBridge" PREFIX "" )
+if( CMAKE_SIZEOF_VOID_P EQUAL 8 )
+  set( GMDUMPER_BRIDGE_ARCH "x64" )
+
+elseif(CMAKE_SIZEOF_VOID_P EQUAL 4)
+
+  set( GMDUMPER_BRIDGE_ARCH "x86" )
+
+else()
+
+  message( FATAL_ERROR "Unsupported pointer size: ${CMAKE_SIZEOF_VOID_P}" )
+
+endif()
+
+set_target_properties(
+  GMDumperBridge
+  PROPERTIES
+    OUTPUT_NAME "GMDumperBridge.${GMDUMPER_BRIDGE_ARCH}"
+    PREFIX ""
+)
+
+if( GMDUMPER_BUILD_DISCOVERY_PROBE )
+
+  add_executable( GMDumperDiscoveryProbe tools/DiscoveryProbe.cpp)
+
+  target_compile_features( GMDumperDiscoveryProbe PRIVATE cxx_std_20 )
+
+  target_include_directories( GMDumperDiscoveryProbe PRIVATE include )
+
+  target_link_libraries( GMDumperDiscoveryProbe PRIVATE GMDumperBridge )
+
+endif()

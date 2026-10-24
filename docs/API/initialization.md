@@ -55,7 +55,7 @@ print( status.log )
 | `instancesAvailable` | Current-room instance layout validated |
 | `instanceCount` | Active instance count |
 | `instanceError` | Instance discovery err |
-| `namedReflection` | Bridge/legacy runtime registry can resolve gameplay-field names |
+| `namedReflection` | Bridge, legacy runtime registry, a validated data-file ID map - can resolve gameplay-field names |
 | `reflectionError` | Reflection means error |
 | `bridgeError` | Bridge loading/discovery failure |
 

@@ -11,6 +11,6 @@ cmake -S bridge -B bridge/build -A x64
 cmake --build bridge/build --config Release
 ```
 
-Copy `bridge/build/GMDumperBridge.dll` to `autorun/GMDumperModules`.
+Build both target architectures and copy `GMDumperBridge.x86.dll` and `GMDumperBridge.x64.dll` to `autorun/GMDumperModules`
 
 The bridge and GMDumper are GPL-3.0-or-later. Other licenes can be found in the source file.
