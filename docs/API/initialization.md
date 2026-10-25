@@ -8,6 +8,13 @@
 
 ```lua
 assert( gm_initDumper() )
+
+-- enable caching
+--assert( gm_initDumper { discoveryCache = true } )
+
+-- scan once even if a matching snapshot exists, then replace that snapshot.
+-- assert( gm_initDumper { discoveryCache = true, forceRescan = true } )
+
 ```
 
 | Option | Default | Description |
@@ -23,6 +30,8 @@ assert( gm_initDumper() )
 | `rawVariableSlots` | `64` | Dense slots displayed in Structure Dissect |
 | `rawVariableMapBuckets` | `64` | Sparse buckets displayed in Structure Dissect |
 | `fieldRefreshInterval` | `250` | Symbol refresh interval in milliseconds; minimum 100 |
+| `discoveryCache` | `false` | Opt in to restoring and saving cached scan results for this initialization |
+| `forceRescan` | `false` | With caching enabled, ignore the matching snapshot once and replace it after scanning |
 | `bridge` | `true` | Load the bridge |
 | `bridgeTimeout` | `5000` | Bridge request timeout |
 
@@ -58,6 +67,7 @@ print( status.log )
 | `namedReflection` | Bridge, legacy runtime registry, a validated data-file ID map - can resolve gameplay-field names |
 | `reflectionError` | Reflection means error |
 | `bridgeError` | Bridge loading/discovery failure |
+| `discoveryCache` | Cache hit, executable hash, settings key, and save error |
 
 #### `gm_getState()`
 > Return runtime state.
@@ -82,6 +92,9 @@ print( layout.codeExecute, layout.runRoom )
 local profile = gm_getProfile()
 print( profile.id, profile.architecture, profile.bridge.id )
 ```
+
+#### `gm_clearDiscoveryCache()`
+> Clear the cached executable scan snapshot
 
 ## Bridge
 

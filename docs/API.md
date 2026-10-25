@@ -30,6 +30,8 @@ print( hp.name, ('0x%X'):format( hp.address ), hp.kindName, hp.value )
 
 `gm_getProfile`
 
+`gm_clearDiscoveryCache`
+
 `gm_getBridgeStatus`
 
 `gm_configureBridge`

@@ -65,11 +65,15 @@ local EXPORTS =
   'gmd_configure_discovery_profile',
   'gmd_discover_reflection',
   'gmd_configure_reflection',
+  'gmd_configure_cached_interface',
   'gmd_configure_member_fallback',
   'gmd_configure_array_access',
   'gmd_configure_script_execute',
   'gmd_get_struct_get_keys',
   'gmd_get_struct_get_member',
+  'gmd_get_yy_get_string',
+  'gmd_get_free_rvalue',
+  'gmd_get_struct_add_rvalue',
   'gmd_get_script_find_id',
   'gmd_get_script_perform',
   'gmd_get_array_length',
@@ -238,7 +242,10 @@ local function loadedBridgeModule(pointerSize)
 
   for _, module in ipairs(enumModules() or {}) do
 
-    local fileName = extractFileName( module.PathToFile or '' )
+    -- PathToFile may be unavailable under restricted module enumeration even though CE still supplies the module's Name
+    -- Either field is sufficient
+    local reportedName = type(module.PathToFile) == 'string' and module.PathToFile ~= '' and module.PathToFile or module.Name
+    local fileName = extractFileName( reportedName or '' )
     local lowered = tostring(fileName or ''):lower()
 
     if lowered == installedName or lowered:sub(1, #architecturePrefix) == architecturePrefix then
@@ -247,6 +254,175 @@ local function loadedBridgeModule(pointerSize)
 
   end
 
+end
+
+--- Locate loaded bridge directly through committed image mappings
+-- @param pointerSize number
+-- @return table|nil @ synthetic module descriptor
+-- @return table|nil @ resolved bridge exports
+local function mappedBridgeModule(pointerSize)
+  local candidates = {}
+  local seen = {}
+
+  for _, region in ipairs(enumMemoryRegions() or {}) do
+    local base = tonumber(region.AllocationBase) or tonumber(region.BaseAddress)
+    local committed = region.State == nil or region.State == 0x1000
+    
+    -- standard LoadLibrary images are MEM_IMAGE.
+    -- CE can also be configured to use a manual/stealth mapper, whose allocations are MEM_PRIVATE and are intentionally absent from the PEB module list.
+    local image = region.Type == nil or region.Type == 0x1000000 or region.Type == 0x20000
+
+    if base and base ~= 0 and committed and image and not seen[base] then
+      seen[base] = true
+      candidates[ #candidates + 1 ] =
+      {
+        Address = base,
+        PathToFile = type(region.Extra) == 'string' and region.Extra or '',
+      }
+    end
+
+  end
+
+  for _, module in ipairs(candidates) do
+
+    if readSmallInteger(module.Address) == 0x5A4D then
+
+      local peOffset = readInteger( module.Address + 0x3C )
+
+      local magic = peOffset and readSmallInteger( module.Address + peOffset + 0x18 ) or nil
+
+      local architectureMatches = pointerSize == 8 and magic == 0x20B or pointerSize == 4 and magic == 0x10B
+
+      if architectureMatches then
+        local exports = resolveExports(module)
+        if exports then
+          return module, exports
+        end
+
+      end
+
+    end
+
+  end
+
+end
+
+--- Ask CE to observe modules loaded since its last symbol snapshot
+-- loadNewSymbols is the narrow operation intended for this case.  Waiting for
+-- exports makes the subsequent lookup deterministic on CE builds which update
+-- symbols asynchronously.  Calls are synchronized because these APIs own CE's
+-- process-wide symbol handler.
+local function refreshLoadedModules()
+
+  local function refresh()
+    loadNewSymbols() -- CE 7.7+: update only newly loaded modules
+    --reinitializeSymbolhandler( true )
+    waitForExports()
+  end
+
+  if inMainThread() then
+    refresh()
+  else
+    synchronize(refresh) -- probably threadsafe but still
+  end
+
+end
+
+--- Load the bridge via target's LoadLibraryW, get HMODULE / result
+-- @param path string
+-- @param pointerSize number
+-- @return table|nil @ synthetic module descriptor
+-- @return table|nil @ resolved bridge exports
+-- @return string|nil
+-- @return boolean @ true when LoadLibraryW returned an HMODULE
+local function loadBridgeDirectly(path, pointerSize)
+
+  local loadLibrary = getAddressSafe( 'kernel32.LoadLibraryW' )
+
+  if not loadLibrary then
+    refreshLoadedModules()
+    loadLibrary = getAddressSafe( 'kernel32.LoadLibraryW' )
+  end
+
+  if not loadLibrary then return nil, nil, 'kernel32.LoadLibraryW wasnt resolved', false end
+
+  -- VirtualAllocEx-backed CE allocations are zero initialized.
+  -- so no need to null-terminate?
+  local pathBuffer = allocateMemory( (#path + 1) * 2 )
+  if not pathBuffer then return nil, nil, 'Couldnt allocate the remote bridge path', false end
+
+  local wrote = writeString( pathBuffer, path, true )
+  local called, moduleBase
+
+  if wrote then
+    called, moduleBase = pcall( executeCodeEx, 0, 10000, loadLibrary, { type = 0, value = pathBuffer } )
+  end
+
+  deAlloc( pathBuffer )
+
+  if not wrote then return nil, nil, 'Couldnt write the remote bridge path', false end
+
+  if not called then return nil, nil, 'LoadLibraryW execution failed: ' .. tostring(moduleBase), false end
+
+  if type(moduleBase) ~= 'number' or moduleBase == 0 then return nil, nil, 'Target LoadLibraryW rejected the bridge DLL', false end
+
+  local module =
+  {
+    Address = moduleBase,
+    PathToFile = path,
+  }
+
+  local exports, exportError = resolveExports(module)
+  
+  if not exports then
+    return module, nil, exportError, true
+  end
+
+  return module, exports, nil, true
+end
+
+--- Resolve injected bridge after CE has refreshed its module snapshot
+-- @param pointerSize number
+-- @return table|nil @ module descriptor
+-- @return table|nil @ resolved bridge exports
+-- @return string|nil
+local function resolveInjectedBridge(pointerSize)
+
+  local module = loadedBridgeModule( pointerSize )
+  local exports, exportError
+
+  if module then
+    exports, exportError = resolveExports( module )
+    
+    if exports then
+      return module, exports
+    end
+
+  end
+
+  refreshLoadedModules()
+
+  for _ = 1, 4 do -- TODO: remove
+    module = loadedBridgeModule(pointerSize)
+
+    if module then
+      exports, exportError = resolveExports(module)
+
+      if exports then
+        return module, exports
+      end
+    end
+
+    sleep(25)
+  end
+
+  module, exports = mappedBridgeModule(pointerSize)
+
+  if exports then
+    return module, exports
+  end
+
+  return nil, nil, exportError or 'Injected bridge wasnt visible through CE module or memory-map enumeration'
 end
 
 --- local bridge path readable?
@@ -402,31 +578,47 @@ function Bridge.load(path, pointerSize)
       return nil, 'Bridge DLL unavailable: no attached DLL and no readable file at ' .. tostring(path)
     end
 
-    local called, injected = pcall(injectDLL, path)
+    local loadedDirectly
 
-    if not called or injected ~= true then
-      discardTemporaryBridge(temporaryPath)
-      return nil, 'Couldnt inject the bridge: ' .. tostring(injected)
+    loadedModule, exports, exportError, loadedDirectly = loadBridgeDirectly( path, pointerSize )
+
+    if loadedDirectly and not exports then
+
+      discardTemporaryBridge( temporaryPath )
+
+      return nil, 'Bridge loaded at ' .. ('0x%X'):format( loadedModule.Address ) .. ', but exports werent resolved: ' .. tostring(exportError or 'unknown error')
     end
 
-    loadedModule = loadedBridgeModule(pointerSize)
+    if not loadedDirectly then
+      local directError = exportError
+      local injected = injectDLL(path)
 
-    if loadedModule then
-      exports, exportError = resolveExports(loadedModule)
-    else
-      exportError = 'Injected bridge module wasnt returned by enumModules()'
+      if injected ~= true then
+        discardTemporaryBridge( temporaryPath )
+
+        return nil, 'Couldnt load the bridge: ' .. tostring(directError) .. '; injectDLL: ' .. tostring(injected)
+      end
+
+      loadedModule, exports, exportError = resolveInjectedBridge( pointerSize )
+
+      if not exports and directError then
+        exportError = tostring(exportError) .. '; direct LoadLibraryW: ' .. tostring(directError)
+      end
+
     end
+
   end
 
   if not exports then
-    discardTemporaryBridge(temporaryPath)
+    discardTemporaryBridge( temporaryPath )
     return nil, 'Bridge injected, but exports werent resolved: ' .. tostring(exportError or 'unknown error')
   end
   
   -- check abi version
   local abi = call( exports.gmd_bridge_abi )
+
   if abi ~= Bridge.ABI then
-    discardTemporaryBridge(temporaryPath)
+    discardTemporaryBridge( temporaryPath )
     return nil, ('Bridge ABI mismatch: Lua expects %d, DLL provides %s'):format( Bridge.ABI, tostring(abi) )
   end
 
@@ -551,7 +743,33 @@ function Bridge.configure(codeExecute, reflection, arrayEquals, arrayLength, scr
   end
 
   -- explicit addresses win. Otherwise the profile decides if structural scan is supported for this runner
-  if reflection and reflection.structGetKeys and reflection.structGetMember then
+  if reflection
+     and reflection.yyGetString
+     and reflection.freeRValue
+     and reflection.scriptFindId
+     and reflection.scriptPerform
+     and reflection.structAddRValue
+     and reflection.structGetMember
+     and reflection.structGetKeys
+     and reflection.arrayLength
+  then
+
+    if Bridge.call(
+                    'gmd_configure_cached_interface',
+                    reflection.yyGetString,
+                    reflection.freeRValue,
+                    reflection.scriptFindId,
+                    reflection.scriptPerform,
+                    reflection.structAddRValue,
+                    reflection.structGetMember,
+                    reflection.structGetKeys,
+                    reflection.arrayLength
+                  ) ~= 1
+    then
+      return nil, Bridge.lastError()
+    end
+
+  elseif reflection and reflection.structGetKeys and reflection.structGetMember then
 
     if Bridge.call( 'gmd_configure_reflection', reflection.structGetKeys, reflection.structGetMember ) ~= 1 then return nil, Bridge.lastError() end
 
@@ -636,6 +854,9 @@ function Bridge.status()
     memberFallbackError = Bridge.State.memberFallbackError,
     structGetKeys = structGetKeys,
     structGetMember = structGetMember,
+    yyGetString = Bridge.State.exports and Bridge.call( 'gmd_get_yy_get_string' ) or nil,
+    freeRValue = Bridge.State.exports and Bridge.call( 'gmd_get_free_rvalue' ) or nil,
+    structAddRValue = Bridge.State.exports and Bridge.call( 'gmd_get_struct_add_rvalue' ) or nil,
     scriptFindId = Bridge.State.exports and Bridge.call( 'gmd_get_script_find_id' ) or nil,
     scriptPerform = Bridge.State.exports and Bridge.call( 'gmd_get_script_perform' ) or nil,
     arrayLength = Bridge.State.exports and Bridge.call( 'gmd_get_array_length' ) or nil,

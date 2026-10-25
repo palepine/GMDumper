@@ -72,11 +72,20 @@ int wmain(int argument_count, wchar_t **arguments)
     return 4;
   }
 
+  const auto base = reinterpret_cast< std::uintptr_t >( module );
+
+  const auto keys = static_cast< std::uintptr_t >( gmd_get_struct_get_keys() );
+
+  const auto member = static_cast< std::uintptr_t >( gmd_get_struct_get_member() );
+
   std::printf(
-               "pointerSize=%u StructGetKeys=%llX StructGetMember=%llX fallbackHelpers=%s\n",
+               "pointerSize=%u module=%llX StructGetKeys=%llX (rva=%llX) StructGetMember=%llX (rva=%llX) fallbackHelpers=%s\n",
                pointer_size,
-               static_cast< unsigned long long >( gmd_get_struct_get_keys() ),
-               static_cast< unsigned long long >( gmd_get_struct_get_member() ),
+               static_cast< unsigned long long >( base ),
+               static_cast< unsigned long long >( keys ),
+               static_cast< unsigned long long >( keys ? keys - base : 0 ),
+               static_cast< unsigned long long >( member ),
+               static_cast< unsigned long long >( member ? member - base : 0 ),
                gmd_configure_member_fallback( reinterpret_cast<void*>(1), reinterpret_cast<void*>(1) ) ? "yes" : "no"
              );
 

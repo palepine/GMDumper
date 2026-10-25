@@ -86,6 +86,18 @@ GMD_API std::uint32_t gmd_discover_reflection_at(void* module);
 /// Use caller-validated reflection functions instead of automatic discovery.
 GMD_API std::uint32_t gmd_configure_reflection(void* struct_get_keys, void* struct_get_member);
 
+/// Restore a previously validated YYRunnerInterface from module-relative cache entries.
+GMD_API std::uint32_t gmd_configure_cached_interface(
+                                                        void* yy_get_string,
+                                                        void* free_rvalue,
+                                                        void* script_find_id,
+                                                        void* script_perform,
+                                                        void* struct_add_rvalue,
+                                                        void* struct_get_member,
+                                                        void* struct_get_keys,
+                                                        void* array_get_length
+                                                      );
+
 /// Configure built-in member-name enumeration used by older interfaces.
 ///
 /// Names are converted to runtime slots through the bridge-discovered Code_Variable_FindAlloc_Slot_From_Name routine.
@@ -103,6 +115,15 @@ GMD_API std::uint64_t gmd_get_struct_get_keys();
 
 /// Return the discovered StructGetMember address, or zero.
 GMD_API std::uint64_t gmd_get_struct_get_member();
+
+/// Return the discovered YYGetString address, or zero.
+GMD_API std::uint64_t gmd_get_yy_get_string();
+
+/// Return the discovered FREE_RValue address, or zero.
+GMD_API std::uint64_t gmd_get_free_rvalue();
+
+/// Return the discovered StructAddRValue address, or zero.
+GMD_API std::uint64_t gmd_get_struct_add_rvalue();
 
 /// Return the discovered Script_Find_Id address, or zero.
 GMD_API std::uint64_t gmd_get_script_find_id();

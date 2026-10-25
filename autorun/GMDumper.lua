@@ -54,6 +54,8 @@ local GM =
 
 local CE_VERSION_SUPPORTED = 7.7
 local SETTINGS_KEY = [[GMDumper\Configuration]]
+local DISCOVERY_CACHE_PREFIX = [[GMDumper\Discovery\v1\]]
+local DISCOVERY_CACHE_SCHEMA = 1
 local CE_DIRECTORY = getCheatEngineDir() or ''
 local SCRIPT_DIRECTORY = CE_DIRECTORY .. [[autorun\]]
 local MODULE_DIRECTORY = SCRIPT_DIRECTORY .. [[GMDumperModules\]]
@@ -310,6 +312,378 @@ end
 
 local Bridge, bridgeLoadError = loadBridge()
 
+-- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--/// DISCOVERY CACHE
+
+--- Cache the process PE and offsets
+-- @param module table
+-- @return table|nil
+-- @return string|nil
+local function discoveryCacheIdentity(module)
+  if not module or type(module.PathToFile) ~= 'string' or module.PathToFile == '' then return nil, 'Executable path unavailable' end
+
+  local digest
+  local file = io.open( module.PathToFile, 'rb' )
+
+  if file then
+    local header = file:read(1024)
+    file:close()
+
+    if type(header) == 'string' and #header > 0 then
+      digest = stringToMD5String(header)
+    end
+  end
+
+  if not digest and module.Address then
+    digest = md5memory( module.Address, math.min(tonumber(module.Size) or 4096, 4096) )
+  end
+
+  if type(digest) ~= 'string' or digest == '' then return nil, 'Executable MD5 unavailable' end
+
+  local name = extractFileName( module.PathToFile )
+
+  return
+  {
+    hash = digest,
+    key = DISCOVERY_CACHE_PREFIX .. name .. '-' .. digest,
+    name = name,
+  }
+end
+
+--- Read one MD5-keyed discovery snapshot from CE settings
+-- @param module table
+-- @return table|nil
+-- @return string|nil
+local function loadDiscoveryCache(module)
+  local identity, identityError = discoveryCacheIdentity(module)
+  if not identity then return nil, identityError end
+
+  local saved = onMainThread( getSettings, identity.key, true )
+
+  if tostring(saved.complete or '') ~= '1' then return nil, 'No complete discovery cache', identity end
+  if tonumber(saved.schema) ~= DISCOVERY_CACHE_SCHEMA then return nil, 'Discovery cache schema mismatch', identity end
+  if tonumber(saved.pointerSize) ~= (targetIs64Bit() and 8 or 4) then return nil, 'Discovery cache architecture mismatch', identity end
+  if tonumber(saved.moduleSize) ~= tonumber(module.Size) then return nil, 'Discovery cache image-size mismatch', identity end
+
+  local function number(name)
+    local value = saved[name]
+    return value ~= nil and tonumber(value) or nil
+  end
+
+  local count = number('functionCount')
+  if not count or count < 1 or count > 0x4000 then return nil, 'Discovery cache function count invalid', identity end
+
+  local entries = {}
+
+  for index = 1, count do
+    local prefix = 'function.' .. index .. '.'
+    local name = saved[ prefix .. 'name' ]
+    local routineRva = number( prefix .. 'routineRva' )
+
+    if type(name) ~= 'string' or name == '' or not routineRva then return nil, 'Discovery cache function entry incomplete', identity end
+
+    entries[index] =
+    {
+      name = name,
+      routineRva = routineRva,
+      argumentCount = number( prefix .. 'argumentCount' ),
+      usageCount = number( prefix .. 'usageCount' ),
+    }
+  end
+
+  local scripts = {}
+  local scriptCount = number( 'scriptCount' ) or 0
+
+  if scriptCount < 0 or scriptCount > 0x10000 then return nil, 'Discovery cache script count invalid', identity end
+
+  for index = 1, scriptCount do
+    local prefix = 'script.' .. index .. '.'
+    local name = saved[ prefix .. 'name' ]
+    local routineRva = number( prefix .. 'routineRva' )
+
+    if type(name) ~= 'string' or name == '' or not routineRva then return nil, 'Discovery cache script entry incomplete', identity end
+
+    scripts[index] =
+    {
+      index = number( prefix .. 'index' ),
+      name = name,
+      routineRva = routineRva,
+      argumentCount = number( prefix .. 'argumentCount' ),
+      usageCount = number( prefix .. 'usageCount' ),
+    }
+  end
+
+  local bridgeNames =
+  {
+    'yyGetString',
+    'freeRValue',
+    'scriptFindId',
+    'scriptPerform',
+    'structAddRValue',
+    'structGetMember',
+    'structGetKeys',
+    'arrayLength',
+  }
+
+  local bridge = {}
+
+  for _, name in ipairs(bridgeNames) do
+    local rva = number( 'bridge.' .. name .. 'Rva' )
+
+    if rva then
+      bridge[ name ] = module.Address + rva
+    end
+  end
+
+  local result =
+  {
+    identity = identity,
+    functionTable =
+    {
+      kind = saved.functionEntryKind,
+      stride = number('functionEntryStride'),
+      startRva = number('functionTableRva'),
+      registrarRva = number('functionRegistrarRva'),
+      entries = entries,
+    },
+    scripts = scripts,
+    runnerScore = number('runnerScore'),
+    codeExecuteRva = number('codeExecuteRva'),
+    runRoomRva = number('runRoomRva'),
+    roomActiveListOffset = number('roomActiveListOffset'),
+    instanceMembersOffset = number('instanceMembersOffset'),
+    instanceFlinkOffset = number('instanceFlinkOffset'),
+    instanceMotionOffsetShift = number('instanceMotionOffsetShift'),
+  }
+
+  local bridgeComplete = true
+
+  for _, name in ipairs(bridgeNames) do
+    if not bridge[name] then
+      bridgeComplete = false
+      break
+    end
+  end
+
+  if bridgeComplete then
+    result.bridge = bridge
+  end
+
+  return result, nil, identity
+end
+
+--- Apply cached values without overriding explicit caller configuration
+-- @param configured table
+-- @param cache table
+-- @param module table
+-- @return table @ keys injected into configured
+local function applyDiscoveryCache(configured, cache, module)
+  local applied = {}
+
+  local function set(name, value)
+
+    if configured[name] == nil and value ~= nil then
+      configured[name] = value
+      applied[name] = true
+    end
+
+  end
+
+  set( 'cachedFunctionTable', cache.functionTable )
+  set( 'cachedScripts', cache.scripts )
+  set( 'cachedRunnerScore', cache.runnerScore )
+  set( 'cachedCodeExecuteRva', cache.codeExecuteRva )
+  set( 'runRoomAddress', cache.runRoomRva and module.Address + cache.runRoomRva or nil )
+  set( 'roomActiveListOffset', cache.roomActiveListOffset )
+  set( 'instanceMembersOffset', cache.instanceMembersOffset )
+  set( 'instanceFlinkOffset', cache.instanceFlinkOffset )
+  set( 'instanceMotionOffsetShift', cache.instanceMotionOffsetShift )
+  set( 'cachedBridgeReflection', cache.bridge )
+
+  if applied.runRoomAddress then
+    configured.cachedRunRoom = true
+  end
+
+  configured.loadedDiscoveryCache = cache
+  configured.discoveryCacheApplied = applied
+  return applied
+end
+
+--- Remove values injected from a rejected cache before a full retry
+-- @param configured table
+local function removeAppliedDiscoveryCache(configured)
+  for name in pairs( configured.discoveryCacheApplied or {} ) do
+    configured[name] = nil
+  end
+
+  configured.cachedRunRoom = nil
+  configured.loadedDiscoveryCache = nil
+  configured.discoveryCacheApplied = nil
+end
+
+--- Store validated discovery as module-relative values
+-- @param state table
+-- @return table|nil
+-- @return string|nil
+local function saveDiscoveryCache(state)
+  local module = state and state.module
+
+  local identity, identityError = discoveryCacheIdentity( module )
+  if not identity then return nil, identityError end
+
+  local function rva(address)
+    if type(address) ~= 'number' or address < module.Address or address >= module.Address + module.Size then return nil end
+    return address - module.Address
+  end
+
+  local functions = state.functionTable and state.functionTable.functions or {}
+  local functionEntries = {}
+
+  for index, entry in ipairs(functions) do
+
+    local routineRva = rva( entry.routine )
+    if not routineRva then return nil, ('Function %s is outside the main image'):format(tostring(entry.name)) end
+
+    functionEntries[index] =
+    {
+      name = entry.name,
+      routineRva = routineRva,
+      argumentCount = entry.argumentCount,
+      usageCount = entry.usageCount,
+    }
+  end
+
+  local scriptEntries = {}
+
+  for index, entry in ipairs(state.scripts or {}) do
+
+    local routineRva = rva( entry.routine )
+    if not routineRva then return nil, ('Script %s is outside the main image'):format(tostring(entry.name)) end
+
+    scriptEntries[index] =
+    {
+      index = entry.index,
+      name = entry.name,
+      routineRva = routineRva,
+      argumentCount = entry.argumentCount,
+      usageCount = entry.usageCount,
+    }
+  end
+
+  local bridge = Bridge and Bridge.State.configured and Bridge.status() or nil
+  local instanceRuntime = state.instances
+  local roomLayout = instanceRuntime and instanceRuntime.roomLayout
+  local instanceLayout = instanceRuntime and instanceRuntime.instanceLayout
+
+  local values =
+  {
+    schema = DISCOVERY_CACHE_SCHEMA,
+    pointerSize = state.pointerSize,
+    moduleSize = module.Size,
+    runnerScore = state.runnerScore,
+    functionCount = #functionEntries,
+    functionEntryKind = state.functionTable.layout.kind,
+    functionEntryStride = state.functionTable.layout.stride,
+    functionTableRva = rva( state.functionTable.start ),
+    functionRegistrarRva = rva( state.functionTable.registrar ),
+    scriptCount = #scriptEntries,
+    codeExecuteRva = rva( state.codeExecute ),
+    runRoomRva = instanceRuntime and rva( instanceRuntime.runRoomAddress ) or nil,
+    roomActiveListOffset = roomLayout and roomLayout.activeListOffset or nil,
+    instanceMembersOffset = instanceLayout and instanceLayout.membersOffset or nil,
+    instanceFlinkOffset = instanceLayout and instanceLayout.flinkOffset or nil,
+    instanceMotionOffsetShift = instanceLayout and instanceLayout.motionOffsetShift or nil,
+  }
+
+  for index, entry in ipairs(functionEntries) do
+    local prefix = 'function.' .. index .. '.'
+    values[ prefix .. 'name' ] = entry.name
+    values[ prefix .. 'routineRva' ] = entry.routineRva
+    values[ prefix .. 'argumentCount' ] = entry.argumentCount
+    values[ prefix .. 'usageCount' ] = entry.usageCount
+  end
+
+  for index, entry in ipairs(scriptEntries) do
+    local prefix = 'script.' .. index .. '.'
+    values[ prefix .. 'index' ] = entry.index
+    values[ prefix .. 'name' ] = entry.name
+    values[ prefix .. 'routineRva' ] = entry.routineRva
+    values[ prefix .. 'argumentCount' ] = entry.argumentCount
+    values[ prefix .. 'usageCount' ] = entry.usageCount
+  end
+
+  if bridge then
+
+    local bridgeAddresses =
+    {
+      yyGetString = bridge.yyGetString,
+      freeRValue = bridge.freeRValue,
+      scriptFindId = bridge.scriptFindId,
+      scriptPerform = bridge.scriptPerform,
+      structAddRValue = bridge.structAddRValue,
+      structGetMember = bridge.structGetMember,
+      structGetKeys = bridge.structGetKeys,
+      arrayLength = bridge.arrayLength,
+    }
+
+    for name, address in pairs(bridgeAddresses) do
+      local relative = rva(address)
+
+      if relative then
+        values['bridge.' .. name .. 'Rva'] = relative
+      end
+    end
+
+  end
+
+  onMainThread(
+    function()
+      local saved = getSettings( identity.key, true )
+
+      for name in pairs(saved.getValueList() or {}) do
+        saved[name] = nil
+      end
+
+      for name, value in pairs(values) do
+
+        if value ~= nil then
+          saved[name] = tostring(value)
+        end
+
+      end
+
+      -- completion written last
+      saved.complete = '1'
+    end
+  )
+
+  return identity
+end
+
+--- Clear persisted discovery snapshot for the exe
+-- @return boolean|nil
+-- @return number|string|nil
+-- @return string|nil
+local function clearDiscoveryCache()
+  local module = Runtime.Memory.mainModule()
+
+  local identity, identityError = discoveryCacheIdentity(module)
+  if not identity then return nil, identityError end
+
+  return onMainThread(
+    function()
+      local saved = getSettings( identity.key, true )
+      local removed = 0
+
+      for name in pairs(saved.getValueList() or {}) do
+        saved[name] = nil
+        removed = removed + 1
+      end
+
+      return true, removed, identity.key
+    end
+  )
+end
+
 --- Install bridge-backed reflection on an initialized state
 -- @param state table
 -- @param configured table
@@ -319,7 +693,7 @@ local function installBridgeResolvers(state, configured)
     return Bridge.annotateStorage( storage, configured.maximumRawVariables or 0x4000, configured.bridgeTimeout or 5000 )
   end
 
-  local globalScope = Runtime.Reflection.findFunction( state, '@@GlobalScope@@' )
+  local globalScope = Runtime.Reflection.findFunctionExact( state, '@@GlobalScope@@' )
 
   state.globals = state.globals or {}
 
@@ -369,7 +743,7 @@ local function options()
   local scanScripts = tostring( settings.scanScripts or 'true' ) ~= 'false'
 
   local fieldRefreshInterval = math.max(100, tonumber(settings.fieldRefreshInterval) or 250)
-  
+
   return
   {
     minimumFunctionCount = minimum,
@@ -377,6 +751,9 @@ local function options()
     maximumInstances = maximumInstances,
     scanScripts = scanScripts,
     fieldRefreshInterval = fieldRefreshInterval,
+    -- discovery persistence is configurable
+    -- normal init must always scan the exe from scratch
+    discoveryCache = false,
   }
 end
 
@@ -429,8 +806,29 @@ function GM.API.gm_initDumper(overrides) -- TODO: export to functions
   local configured = options() -- settings
   for key, value in pairs(overrides or {}) do configured[key] = value end
 
+  local module = Runtime.Memory.mainModule()
+  local cache
+  local cacheNeedsRefresh = false
+
+  if configured.discoveryCache == true and configured.forceRescan ~= true then
+    cache = loadDiscoveryCache(module)
+
+    if cache then
+      applyDiscoveryCache( configured, cache, module )
+      log('restoring discovery from ' .. cache.identity.key)
+    end
+  end
+
   -- target-side scanner, validation. Exit if fails
   local state, scannerError = Runtime.initialize(configured)
+
+  if not state and cache then
+    log('saved discovery rejected, rescanning: ' .. tostring(scannerError))
+    removeAppliedDiscoveryCache(configured)
+    state, scannerError = Runtime.initialize(configured)
+    cache = nil
+  end
+
   if not state then
     GM.State.lastError = scannerError
     log('initialization failed: ' .. tostring(scannerError))
@@ -451,14 +849,15 @@ function GM.API.gm_initDumper(overrides) -- TODO: export to functions
   state.bridge = { available = false , error = bridgeLoadError or bridgeProfileError }
 
   local manualReflection = configured.structGetKeys and configured.structGetMember
+  local cachedReflection = not manualReflection and configured.cachedBridgeReflection or nil
 
-  if configured.bridge ~= false and (state.profile.bridge.automatic ~= false or manualReflection) and state.codeExecute and Bridge then
+  if configured.bridge ~= false and (state.profile.bridge.automatic ~= false or manualReflection or cachedReflection) and state.codeExecute and Bridge then
     
     -- Nil normally, bridge discovers the ABI, otherwise manually
     local reflection = configured.structGetKeys
                        and configured.structGetMember
                        and {  structGetKeys = configured.structGetKeys , structGetMember = configured.structGetMember  }
-                       or nil
+                       or cachedReflection
     
     local arrayEquals = Runtime.Reflection.findFunction( state, 'array_equals' )
     local arrayLength = Runtime.Reflection.findFunction( state, 'array_length' )
@@ -477,6 +876,23 @@ function GM.API.gm_initDumper(overrides) -- TODO: export to functions
                                                         memberGetNames and memberGetNames.routine,
                                                         memberNamesCount and memberNamesCount.routine
                                                       )
+
+    if not bridgeState and cachedReflection and state.profile.bridge.automatic ~= false then
+      log('cached bridge interface rejected, rediscovering: ' .. tostring(bridgeError))
+      cacheNeedsRefresh = true
+
+      bridgeState, bridgeError = Bridge.configure(
+                                                  state.codeExecute,
+                                                  nil,
+                                                  arrayEquals and arrayEquals.routine,
+                                                  arrayLength and arrayLength.routine,
+                                                  scriptExecute and scriptExecute.routine,
+                                                  state.profile.bridge,
+                                                  state.pointerSize,
+                                                  memberGetNames and memberGetNames.routine,
+                                                  memberNamesCount and memberNamesCount.routine
+                                                )
+    end
     
     if bridgeState then
       state.bridge = bridgeState
@@ -525,12 +941,53 @@ function GM.API.gm_initDumper(overrides) -- TODO: export to functions
   shared.restoringFieldBindings = false
 
   if next(shared.boundFieldSymbols) then startFieldResolver(state) end
+
+  if configured.discoveryCache == true then
+    
+    local bridgeWasAdded = cache
+                           and not cache.bridge
+                           and state.bridge
+                           and state.bridge.available
+
+    local instanceLayoutWasAdded = cache
+                                   and not cache.runRoomRva
+                                   and state.instances
+                                   and state.instances.runRoomAddress
+
+    local shouldSave = not cache or cacheNeedsRefresh or bridgeWasAdded or instanceLayoutWasAdded
+
+    local savedIdentity, cacheError
+
+    if shouldSave then
+      savedIdentity, cacheError = saveDiscoveryCache(state)
+    else
+      savedIdentity = cache.identity
+    end
+
+    state.discoveryCache =
+    {
+      hit = cache ~= nil,
+      hash = savedIdentity and savedIdentity.hash or cache and cache.identity.hash or nil,
+      key = savedIdentity and savedIdentity.key or cache and cache.identity.key or nil,
+      error = cacheError,
+    }
+
+    if cacheError then
+      log('discovery cache wasnt saved: ' .. tostring(cacheError))
+    end
+  end
   
   log(
       ('ready: %s, version %s, profile %s, %d built-ins, %d compiled scripts, instances %s, %s')
-      :format( state.runnerKind, state.version.text, state.profile.id, #state.functionTable.functions, #state.scripts,
-               state.instances and (state.instances.available and 'available' or state.instances.error) or 'disabled', state.identity.name)
-    )
+      :format(
+                state.runnerKind,
+                state.version.text,
+                state.profile.id,
+                #state.functionTable.functions,
+                #state.scripts,
+                state.instances and (state.instances.available and 'available' or state.instances.error) or 'disabled', state.identity.name
+              )
+      )
 
   return state
 end
@@ -589,6 +1046,7 @@ function GM.API.gm_getStatus()
     reflectionError = reflectionError,
 
     bridgeError = state and state.bridge and state.bridge.error or nil,
+    discoveryCache = state and state.discoveryCache or nil,
   }
 end
 
@@ -940,8 +1398,8 @@ resetFieldBindings = function()
   local changedSymbols = {} 
 
   for symbol, binding in pairs( shared.boundFieldSymbols ) do
-    
-    if binding.registered then
+
+    if binding.registered or getAddressSafe(symbol) ~= nil then
       unregisterSymbol(symbol)
       changedSymbols[symbol] = true
     end
@@ -1415,6 +1873,12 @@ local function detachObjectFieldWatch(watchId)
 
       end
 
+    elseif getAddressSafe(symbol) ~= nil then
+      -- repair stale CE state even if the binding metadata was already lost.
+      unregisterSymbol(symbol)
+      shared.symbols[symbol] = nil
+      shared.fieldSymbolCache[symbol] = nil
+      changedSymbols[symbol] = true
     end
 
   end
@@ -1429,8 +1893,8 @@ end
 -- @param state table
 -- @param watch table
 local function installObjectFieldWatch(state, watch)
+  local displacedSymbols = {}
 
-  -- complete validation first
   for _, fieldName in ipairs( watch.fields ) do
 
     local symbol = objectFieldSymbol( watch.objectName, fieldName )
@@ -1441,7 +1905,12 @@ local function installObjectFieldWatch(state, watch)
       return nil, ( 'symbol %s already bound to %s.%s'):format( symbol, tostring(existing.objectName), tostring(existing.fieldName) )
     end
 
-    if not existing and getAddressSafe( symbol ) ~= nil then return nil, 'symbol already owned: ' .. symbol end
+    if not existing and getAddressSafe(symbol) ~= nil then
+      unregisterSymbol(symbol)
+      shared.symbols[symbol] = nil
+      shared.fieldSymbolCache[symbol] = nil
+      displacedSymbols[symbol] = true
+    end
 
   end
 
@@ -1450,6 +1919,7 @@ local function installObjectFieldWatch(state, watch)
     ensureWatchedFieldBinding( state, symbol, watch.objectName, fieldName, watch.id )
   end
 
+  reinterpretFieldSymbolRecords(displacedSymbols)
   return watch
 end
 
@@ -1640,7 +2110,27 @@ function GM.API.gm_rescanInstances(overrides)
     refreshFieldBindings(state)
   end
 
+  if state.options.discoveryCache == true then
+    local identity, cacheError = saveDiscoveryCache(state)
+
+    state.discoveryCache =
+    {
+      hit = state.discoveryCache and state.discoveryCache.hit == true or false,
+      hash = identity and identity.hash or state.discoveryCache and state.discoveryCache.hash or nil,
+      key = identity and identity.key or state.discoveryCache and state.discoveryCache.key or nil,
+      error = cacheError,
+    }
+  end
+
   return result.available and result or nil, result.available and nil or result.error
+end
+
+--- Remove the current exe's persisted discovery cache
+-- @return boolean|nil
+-- @return number|string|nil @ removed value count or error
+-- @return string|nil @ settings key
+function GM.API.gm_clearDiscoveryCache()
+  return clearDiscoveryCache()
 end
 
 -- ///---///--///---///--///---///--///--///---///--///---///--///---///--///--///--///--///--///--///--///--///--///--///--/// RVALUE REFLECTION & INVOCATION
@@ -2001,6 +2491,7 @@ local exports =
   'gm_unwatchObjectFields',
   'gm_getObjectFieldWatches',
   'gm_rescanInstances',
+  'gm_clearDiscoveryCache',
   'gm_decodeRValue',
   'gm_listRValueMembers',
   'gm_findRValueMember',

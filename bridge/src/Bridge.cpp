@@ -124,6 +124,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <Windows.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cmath>
@@ -134,6 +135,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -344,6 +346,8 @@ namespace gmd::bridge::detail
   std::atomic< FreeRValue > g_free_rvalue{};
 
   std::atomic< FindVariableSlot > g_find_variable_slot{};
+
+  std::atomic< Routine > g_struct_add_rvalue{};
 
   std::atomic< Routine > g_member_get_names{};
 
@@ -670,6 +674,67 @@ namespace gmd::bridge::detail
     return current;
   }
 
+#if defined(_WIN64)
+
+  /// Score the structural operations required of StructGetKeys.
+  ///
+  /// key enumerator walks the YYObjectBase member map, indexes 16-byte entries,
+  // writes name pointers to the caller-provided output array. 
+  std::uint32_t struct_get_keys_score(void* function)
+  {
+    const auto instructions = disassemble( follow_direct_jumps( function ), 0x180 );
+    
+    std::uint32_t member_map_accesses{};
+    
+    bool scales_entries{};
+    
+    bool writes_output_array{};
+
+    for (const auto &instruction : instructions)
+    {
+      if ( instruction.info.mnemonic == ZYDIS_MNEMONIC_RET || instruction.info.mnemonic == ZYDIS_MNEMONIC_INT3 )
+      {
+        break;
+      }
+
+      for (std::uint8_t index = 0; index < instruction.info.operand_count_visible; ++index)
+      {
+        const auto &operand = instruction.operands[ index ];
+
+        if ( operand.type == ZYDIS_OPERAND_TYPE_MEMORY && operand.mem.disp.has_displacement && operand.mem.disp.value == 0x48 )
+        {
+          ++member_map_accesses;
+        }
+      }
+
+      if (
+           instruction.info.mnemonic == ZYDIS_MNEMONIC_SHL &&
+           instruction.info.operand_count_visible >= 2 &&
+           instruction.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+           instruction.operands[1].imm.value.u == 4
+         )
+      {
+        scales_entries = true;
+      }
+
+      if (
+           instruction.info.mnemonic == ZYDIS_MNEMONIC_MOV &&
+           instruction.info.operand_count_visible >= 2 &&
+           instruction.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+           instruction.operands[0].mem.index != ZYDIS_REGISTER_NONE &&
+           instruction.operands[0].mem.scale == 8 &&
+           instruction.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER
+         )
+      {
+        writes_output_array = true;
+      }
+    }
+
+    return member_map_accesses + (scales_entries ? 1u : 0u) + (writes_output_array ? 1u : 0u);
+  }
+
+#endif
+
   /// Return the first direct CALL/JMP target in a bounded function prefix.
   void* first_direct_target(void* function, std::size_t maximum, bool accept_jump)
   {
@@ -716,8 +781,6 @@ namespace gmd::bridge::detail
     return reinterpret_cast< FindVariableSlot >( find_slot );
   }
 
-#if !defined(_WIN64)
-
   bool executable_pointer(const void* address)
   {
     MEMORY_BASIC_INFORMATION region{};
@@ -731,6 +794,8 @@ namespace gmd::bridge::detail
 
     return protection == PAGE_EXECUTE || protection == PAGE_EXECUTE_READ || protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
   }
+
+#if !defined(_WIN64)
 
   /// Recover the member-dictionary walk used by x86 GMS2's variable_instance_get_names implementation.
   ///
@@ -1026,6 +1091,8 @@ namespace gmd::bridge::detail
 
     g_find_variable_slot.store( nullptr, std::memory_order_release );
 
+    g_struct_add_rvalue.store( nullptr, std::memory_order_release );
+
     g_member_get_names.store( nullptr, std::memory_order_release );
 
     g_member_names_count.store( nullptr, std::memory_order_release );
@@ -1071,6 +1138,23 @@ namespace gmd::bridge::detail
     // x64 initializers use stable RBP/RSP frames.
     // constraining each candidate to one bounded window is distinct
     // broader base-anchored search below is for x86 register-based initializers
+    std::unordered_map< std::uintptr_t, std::uint32_t > key_scores;
+
+    const auto key_score = [&](std::uintptr_t target)
+    {
+      const auto cached = key_scores.find( target );
+
+      if ( cached != key_scores.end() )
+      {
+        return cached->second;
+      }
+
+      const auto score = target >= text_start && target < text_end ? struct_get_keys_score( reinterpret_cast<void*>(target) ) : 0u;
+
+      key_scores.emplace( target, score );
+      return score;
+    };
+
     for (std::size_t start = 0; start < assignments.size(); ++start)
     {
       std::size_t finish = start;
@@ -1087,7 +1171,10 @@ namespace gmd::bridge::detail
         if ( assignments[ index ].stack_base == assignments[ start ].stack_base ) frame_assignments.push_back( &assignments[ index ] );
       }
 
-      if ( frame_assignments.size() < profile.minimum_assignments || frame_assignments.size() > profile.maximum_assignments ) continue;
+      if ( frame_assignments.size() < profile.minimum_assignments || frame_assignments.size() > profile.maximum_assignments )
+      {
+        continue;
+      }
 
       const auto displacement_less = [](const auto* left, const auto* right)
       {
@@ -1097,7 +1184,50 @@ namespace gmd::bridge::detail
       const auto first = *std::min_element( frame_assignments.begin(), frame_assignments.end(), displacement_less );
       const auto last = *std::max_element( frame_assignments.begin(), frame_assignments.end(), displacement_less );
 
-      if ( last->displacement - first->displacement > profile.maximum_stack_span ) continue;
+      if ( last->displacement - first->displacement > profile.maximum_stack_span )
+      {
+        continue;
+      }
+
+      // StructGetMember immediately precedes StructGetKeys in observed YYRunnerInterface revision, the absolute slot numbers shifted
+      // figure out the key routine by behavior first, then require the adjacent interface assignment.
+      for (const auto* keys_assignment : frame_assignments)
+      {
+        if ( key_score(keys_assignment->target) < 3 )
+        {
+          continue;
+        }
+
+        const auto member_displacement = keys_assignment->displacement - static_cast< std::ptrdiff_t >( sizeof( void* ) );
+
+        for (const auto* member_assignment : frame_assignments)
+        {
+          if ( member_assignment->displacement != member_displacement )
+          {
+            continue;
+          }
+
+          if ( member_assignment->target < text_start || member_assignment->target >= text_end )
+          {
+            continue;
+          }
+
+          const auto distance = member_assignment->target > keys_assignment->target
+                                ? member_assignment->target - keys_assignment->target
+                                : keys_assignment->target - member_assignment->target;
+
+          if ( distance > std::min<std::uintptr_t>(profile.maximum_function_distance, 0x100) )
+          {
+            continue;
+          }
+
+          g_struct_get_member.store( reinterpret_cast< StructGetMember >( member_assignment->target ), std::memory_order_release );
+
+          g_struct_get_keys.store( reinterpret_cast< StructGetKeys >( keys_assignment->target ), std::memory_order_release );
+
+          return true;
+        }
+      }
 
       for (const auto* member_assignment : frame_assignments)
       {
@@ -1133,7 +1263,14 @@ namespace gmd::bridge::detail
           continue;
         }
 
+        // require the key routine's member-map walk.
+        if ( struct_get_keys_score( reinterpret_cast< void* >( keys )) < 3 )
+        {
+          continue;
+        }
+
         const auto function_distance = member > keys ? member - keys : keys - member;
+
         if ( function_distance > profile.maximum_function_distance )
         {
           continue;
@@ -1181,6 +1318,7 @@ namespace gmd::bridge::detail
             g_free_rvalue.store( reinterpret_cast< FreeRValue >( free_rvalue ), std::memory_order_release );
 
             g_find_variable_slot.store( find_slot, std::memory_order_release );
+            g_struct_add_rvalue.store( reinterpret_cast< Routine >( struct_add ), std::memory_order_release );
           }
         }
 
@@ -1394,8 +1532,13 @@ namespace gmd::bridge::detail
         if (find_slot)
         {
           g_yy_get_string.store( reinterpret_cast< YYGetString >( selected_yy_get_string ), std::memory_order_release );
+
           g_free_rvalue.store( reinterpret_cast< FreeRValue >( selected_free_rvalue ), std::memory_order_release );
+
           g_find_variable_slot.store( find_slot, std::memory_order_release );
+
+          g_struct_add_rvalue.store( reinterpret_cast< Routine >( selected_struct_add ), std::memory_order_release );
+
         }
       }
 
@@ -1528,6 +1671,8 @@ namespace gmd::bridge::detail
       g_free_rvalue.store( reinterpret_cast< FreeRValue >( free_rvalue ), std::memory_order_release );
 
       g_find_variable_slot.store( find_slot, std::memory_order_release );
+
+      g_struct_add_rvalue.store( reinterpret_cast< Routine >( struct_add ), std::memory_order_release );
 
       g_script_find_id.store( reinterpret_cast< ScriptFindId >( script_find ), std::memory_order_release );
 
@@ -2990,6 +3135,62 @@ std::uint32_t gmd_configure_reflection(void* keys, void* member)
   return 1;
 }
 
+/// Restore YYRunnerInterface helper from cache
+std::uint32_t gmd_configure_cached_interface(
+                                              void* yy_get_string,
+                                              void* free_rvalue,
+                                              void* script_find_id,
+                                              void* script_perform,
+                                              void* struct_add_rvalue,
+                                              void* struct_get_member,
+                                              void* struct_get_keys,
+                                              void* array_get_length
+                                            )
+{
+  clear_error();
+
+  const std::array< void*, 8 > helpers
+  {
+    yy_get_string,
+    free_rvalue,
+    script_find_id,
+    script_perform,
+    struct_add_rvalue,
+    struct_get_member,
+    struct_get_keys,
+    array_get_length,
+  };
+
+  for ( const auto helper : helpers )
+  {
+    if ( !executable_pointer( helper ) )
+    {
+      set_error( "Cached YYRunnerInterface contains a non-executable helper" );
+      return 0;
+    }
+  }
+
+  g_yy_get_string.store( reinterpret_cast< YYGetString >( yy_get_string ), std::memory_order_release );
+
+  g_free_rvalue.store( reinterpret_cast< FreeRValue >( free_rvalue ), std::memory_order_release );
+
+  g_script_find_id.store( reinterpret_cast< ScriptFindId >( script_find_id ), std::memory_order_release );
+
+  g_script_perform.store( reinterpret_cast< ScriptPerform >( script_perform ), std::memory_order_release );
+
+  g_struct_add_rvalue.store( reinterpret_cast< Routine >( struct_add_rvalue ), std::memory_order_release );
+
+  g_find_variable_slot.store( discover_find_variable_slot(struct_add_rvalue), std::memory_order_release );
+
+  g_struct_get_member.store( reinterpret_cast< StructGetMember >( struct_get_member ), std::memory_order_release );
+
+  g_struct_get_keys.store( reinterpret_cast< StructGetKeys >( struct_get_keys ), std::memory_order_release );
+
+  g_array_get_length.store( reinterpret_cast< ArrayGetLength >( array_get_length ), std::memory_order_release );
+
+  return 1;
+}
+
 /// Configure public built-ins used when the runner interface predates direct StructGetKeys/StructGetMember entries
 std::uint32_t gmd_configure_member_fallback(void* get_names, void* names_count)
 {
@@ -3074,6 +3275,24 @@ std::uint64_t gmd_get_struct_get_keys()
 std::uint64_t gmd_get_struct_get_member()
 {
   return reinterpret_cast< std::uint64_t >( g_struct_get_member.load( std::memory_order_acquire ) );
+}
+
+/// Return the discovered YYGetString address, or zero when unavailable.
+std::uint64_t gmd_get_yy_get_string()
+{
+  return reinterpret_cast< std::uint64_t >( g_yy_get_string.load( std::memory_order_acquire ) );
+}
+
+/// Return the discovered FREE_RValue address, or zero when unavailable.
+std::uint64_t gmd_get_free_rvalue()
+{
+  return reinterpret_cast< std::uint64_t >( g_free_rvalue.load( std::memory_order_acquire ) );
+}
+
+/// Return the discovered StructAddRValue address, or zero when unavailable.
+std::uint64_t gmd_get_struct_add_rvalue()
+{
+  return reinterpret_cast< std::uint64_t >( g_struct_add_rvalue.load( std::memory_order_acquire ) );
 }
 
 /// Return the discovered Script_Find_Id address, or zero when unavailable.

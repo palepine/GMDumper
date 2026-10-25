@@ -897,16 +897,23 @@ function Runtime.Discovery.defineVersion(state)
   -- runner metadata is normally preferred
   local selected, reason
 
-  local genericGms2Version = state.profileHint == 'gms2'
-                             and executable
-                             and executable.major == 1
-                             and executable.minor == 0
-                             and executable.release == 0
-                             and executable.build == 0
+  local brandedExecutable = metadataText:find( 'yoyo', 1, true )
+                            or metadataText:find( 'gamemaker', 1, true )
+                            or metadataText:find( 'runner', 1, true )
+
+  local genericRunnerVersion = brandedExecutable
+                               and executable
+                               and executable.major == 1
+                               and executable.minor == 0
+                               and executable.release == 0
+                               and executable.build == 0
+                               and data
+                               and data.inferred
+                               and (tonumber(data.inferred.major) or 0) >= 2
 
   if executable
      and executable.confidence == 'metadata'
-     and not genericGms2Version
+     and not genericRunnerVersion
      and (executable.major == 1 or executable.major == 2 or executable.major >= 2022)
   then
     selected, reason = executable, 'executable version resource'
@@ -916,7 +923,7 @@ function Runtime.Discovery.defineVersion(state)
     selected, reason = data.inferred, 'data.win feature lower bound'
   elseif data and data.stored then
     selected, reason = data.stored, 'stored GEN8 version'
-  elseif genericGms2Version then
+  elseif genericRunnerVersion then
     selected, reason = executable, 'generic GMS2 executable version resource'
   end
 
@@ -1259,6 +1266,121 @@ local function tableScore(candidate)
   end
 
   return count + anchors * 100 - candidate.duplicates * 4
+end
+
+--- Restore cahced function registry from module-relative routines
+-- @param state table
+-- @param cached table
+-- @return table|nil
+-- @return string|nil
+local function restoreCachedFunctionTable(state, cached)
+  if type(cached) ~= 'table' or type(cached.entries) ~= 'table' then return nil, 'cached function registry is missing' end
+
+  local layout
+
+  for _, candidate in ipairs( Runtime.Discovery.functionLayouts(state) ) do
+
+    if candidate.kind == cached.kind and candidate.stride == cached.stride then
+      layout = candidate
+      break
+    end
+
+  end
+
+  if not layout then return nil, 'cached function-entry layout does not match the selected profile' end
+
+  local functions, byName, duplicates = {}, {}, 0
+
+  for index, saved in ipairs(cached.entries) do
+
+    local routine = type(saved.routineRva) == 'number' and state.module.Address + saved.routineRva or nil
+
+    local arguments = tonumber(saved.argumentCount)
+
+    if not isPlausibleName(saved.name) or not Runtime.Memory.isExecutable(state, routine) or arguments == nil or arguments < -1 or arguments > 64 then
+      return nil, ('cached function entry %d no longer validates'):format(index)
+    end
+
+    local entry =
+    {
+      index = index - 1,
+      name = saved.name,
+      routine = routine,
+      argumentCount = arguments,
+      usageCount = tonumber(saved.usageCount) or 0,
+      source = 'md5-cache',
+    }
+
+    functions[ #functions + 1 ] = entry
+
+    if byName[entry.name] then
+      duplicates = duplicates + 1
+    else
+      byName[entry.name] = entry
+    end
+
+  end
+
+  local result =
+  {
+    layout = layout,
+    functions = functions,
+    byName = byName,
+    duplicates = duplicates,
+    start = type(cached.startRva) == 'number' and state.module.Address + cached.startRva or nil,
+    registrar = type(cached.registrarRva) == 'number' and state.module.Address + cached.registrarRva or nil,
+    source = 'md5-cache',
+    cached = true,
+  }
+
+  local imageStart = state.module.Address
+  local imageFinish = imageStart + state.module.Size
+
+  if result.start and (result.start < imageStart or result.start >= imageFinish) then return nil, 'cached function-table root is outside the main image' end
+  if result.registrar and not Runtime.Memory.isExecutable(state, result.registrar) then return nil, 'cached function registrar no longer validates' end
+
+  if #functions < (state.options.minimumFunctionCount or 32) then return nil, 'cached function registry incomplete' end
+
+  local anchors = 0
+
+  for _, name in ipairs(ANCHORS) do
+    if byName[name] then
+      anchors = anchors + 1
+    end
+  end
+
+  if anchors == 0 then return nil, 'cached function registry has no GameMaker anchors' end
+
+  result.score = tableScore(result)
+  return result
+end
+
+--- Restore cached compiled-script descriptors
+-- @param state table
+-- @param cached table
+-- @return table|nil
+local function restoreCachedScripts(state, cached)
+  if type(cached) ~= 'table' then return nil end
+
+  local scripts = {}
+
+  for index, saved in ipairs(cached) do
+    local routine = type(saved.routineRva) == 'number' and state.module.Address + saved.routineRva or nil
+
+    if not isPlausibleName(saved.name) or not Runtime.Memory.isExecutable( state, routine ) then return nil end
+
+    scripts[index] =
+    {
+      index = tonumber(saved.index) or index - 1,
+      name = saved.name,
+      routine = routine,
+      argumentCount = tonumber(saved.argumentCount) or -1,
+      usageCount = tonumber(saved.usageCount) or 0,
+      source = 'md5-cache',
+    }
+  end
+
+  return scripts
 end
 
 --- Read one x86 Function_Add call site
@@ -2635,24 +2757,26 @@ function Runtime.Discovery.findInstanceRuntime(state, cancellation)
   -- each failed step records a capability error
   local variableError
 
-  state.variableTable, variableError = Runtime.Discovery.findVariableTable( state, cancellation )
-  result.variableTableError = variableError
-
   local runRoom
 
   if type(state.options.runRoomAddress) == 'number' then
 
     runRoom = state.options.runRoomAddress
-    result.runRoomSource = 'explicit'
-  elseif state.variableTable then
+    result.runRoomSource = state.options.cachedRunRoom and 'md5-cache' or 'explicit'
+  else
+    state.variableTable, variableError = Runtime.Discovery.findVariableTable( state, cancellation )
+    result.variableTableError = variableError
 
-    local roomVariable = state.variableTable.byName.background_color or state.variableTable.byName.room_width
+    if state.variableTable then
 
-    if roomVariable then
-      runRoom, result.runRoomInstruction = Runtime.Discovery.findRunRoomFromSetter( state, roomVariable.setter )
-      result.runRoomSource = roomVariable.name .. ' setter'
+      local roomVariable = state.variableTable.byName.background_color or state.variableTable.byName.room_width
+
+      if roomVariable then
+        runRoom, result.runRoomInstruction = Runtime.Discovery.findRunRoomFromSetter( state, roomVariable.setter )
+        result.runRoomSource = roomVariable.name .. ' setter'
+      end
+
     end
-
   end
 
   if not runRoom then
@@ -3271,6 +3395,32 @@ function Runtime.Instances.listVariablesRaw(state, selector, maximum, includeNam
     return includeNames == false and storage or resolveVariableNames(state, storage)
   end
 
+  -- YYObjectBase can have a slot domain w/o owning any populated values.
+  -- In the case m_YYVarsMap is null, it's an empty instance
+  if not selected.variableMap or selected.variableMap == 0 then
+    return
+    {
+      instance = selected,
+      storageKind = 'sparse-map',
+      yyVars = selected.yyVars,
+      variableMap = 0,
+      variableCount = count,
+      variableCapacity = capacity,
+      truncated = false,
+      namesAvailable = true,
+      resolvedNameCount = 0,
+      map =
+      {
+        address = 0,
+        bucketCount = 0,
+        usedCount = 0,
+        variables = {},
+        truncated = false,
+      },
+      variables = {},
+    }
+  end
+
   local sparse, sparseError = readSparseVariableMap( state, selected.variableMap, maximum )
   
   if not sparse then
@@ -3538,12 +3688,20 @@ function Runtime.initialize(options, cancellation)
   
   state.profile = Versioning.resolve( { version = state.version , pointerSize = state.pointerSize , profileHint = state.profileHint } )
   
-  Runtime.Discovery.runnerEvidence( state, cancellation )
+  if options.cachedRunnerScore then
+    state.runnerScore = options.cachedRunnerScore
+    state.runnerEvidence = { { marker = 'Hashed scan cache', weight = options.cachedRunnerScore } }
+  else
+    Runtime.Discovery.runnerEvidence( state, cancellation )
+  end
 
   -- built-in function registry is the mandatory reflection root
   local tableResult, tableError
 
-  if type( options.functionTableAddress ) == 'number' then
+  if options.cachedFunctionTable then
+    tableResult, tableError = restoreCachedFunctionTable( state, options.cachedFunctionTable )
+    if not tableResult then return nil, tableError end
+  elseif type( options.functionTableAddress ) == 'number' then
     
     local selectedLayout
 
@@ -3579,14 +3737,26 @@ function Runtime.initialize(options, cancellation)
   state.functionTable = tableResult
 
   -- optional execution/script capabilities
-  if type(options.codeExecuteAddress) == 'number' then
+  if type(options.cachedCodeExecuteRva) == 'number' then
+    state.codeExecute = state.module.Address + options.cachedCodeExecuteRva
+
+    if not Runtime.Memory.isExecutable(state, state.codeExecute) then return nil, 'cached Code_Execute no longer validates' end
+
+    state.codeExecutePattern = 'md5-cache'
+  elseif type(options.codeExecuteAddress) == 'number' then
     state.codeExecute = options.codeExecuteAddress
     state.codeExecutePattern = 'explicit'
   else
     state.codeExecute, state.codeExecuteCall, state.codeExecutePattern = Runtime.Discovery.findCodeExecute( state, cancellation )
   end
 
-  state.scripts = options.scanScripts == false and {} or Runtime.Discovery.findCompiledScripts( state, cancellation )
+  if options.scanScripts == false then
+    state.scripts = {}
+  elseif options.cachedScripts then
+    state.scripts = restoreCachedScripts( state, options.cachedScripts ) or Runtime.Discovery.findCompiledScripts( state, cancellation )
+  else
+    state.scripts = Runtime.Discovery.findCompiledScripts( state, cancellation )
+  end
   state.runnerKind = classifyRunner(state)
 
   -- rooms & instances are an optional here (eg init before a room exists)
@@ -3598,11 +3768,93 @@ function Runtime.initialize(options, cancellation)
   return state
 end
 
---- Find function
+--- Find a function, including validated entries outside the selected contiguous table
+-- @param state table
+-- @param name string
+function Runtime.Reflection.findFunctionExact(state, name)
+  if not state or not state.functionTable or type(name) ~= 'string' then return nil end
+
+  local known = state.functionTable.byName[name]
+  if known then return known end
+
+  -- sometimes internal helpers can be split from the main public RFunction run?
+  -- @@GlobalScope@@ is one such helper in several 2023 builds
+  -- resolve missing names from their validated RFunction entry
+  local image = state.sections and state.sections.image
+  if not image then return nil end
+
+  local pattern = bytePattern(name .. '\0')
+  local stringHits = Runtime.Memory.scan( pattern, image.start, image.finish - 1, nil, 1 )
+  local allStringHits = Runtime.Memory.scan( pattern, nil, nil, nil, 1 )
+  local knownStrings = {}
+  local matches = {}
+  local seen = {}
+
+  for _, address in ipairs(stringHits) do
+    knownStrings[address] = true
+  end
+
+  -- sometimes built-in names are duplicated during registration?
+  for _, address in ipairs(allStringHits) do
+
+    if not knownStrings[address] then
+      stringHits[ #stringHits + 1 ] = address
+      knownStrings[address] = true
+    end
+
+  end
+
+  local layouts = { state.functionTable.layout }
+
+  if not layouts[1] or layouts[1].kind == 'registration' then
+    layouts = Runtime.Discovery.functionLayouts(state)
+  end
+
+  for _, stringAddress in ipairs(stringHits) do
+
+    for _, layout in ipairs(layouts) do
+      if layout.kind == 'registration' then goto nextLayout end
+
+      local entryAddresses
+
+      if layout.kind == 'reference' then
+        -- modern VM runners commonly allocate/copy RFunction entries onto the heap while retaining the static image string
+        -- search aligned memory for that name pointer, as the primary table discovery does
+        entryAddresses = Runtime.Memory.scan( pointerPattern( stringAddress, state.pointerSize ), nil, nil, nil, state.pointerSize )
+      else
+        entryAddresses = { stringAddress }
+      end
+
+      for _, entryAddress in ipairs(entryAddresses) do
+        local entry = readFunctionEntry( state, entryAddress, layout )
+
+        if entry and entry.name == name and not seen[entry.routine] then
+          seen[ entry.routine ] = true
+          entry.source = 'exact-name-reference'
+          matches[ #matches + 1 ] = entry
+        end
+      end
+
+      ::nextLayout::
+    end
+  end
+
+  -- multiple table copies are acceptable only when they resolve to the same routine (deduplicated above)
+  -- refuse ambiguity
+  if #matches ~= 1 then return nil end
+
+  known = matches[1]
+  known.index = #state.functionTable.functions
+  state.functionTable.functions[#state.functionTable.functions + 1] = known
+  state.functionTable.byName[name] = known
+  return known
+end
+
+--- Find function in the discovered public table
 -- @param state table
 -- @param name string
 function Runtime.Reflection.findFunction(state, name)
-  return state and state.functionTable and state.functionTable.byName[ name ] or nil
+  return state and state.functionTable and state.functionTable.byName[name] or nil
 end
 
 --- List functions
