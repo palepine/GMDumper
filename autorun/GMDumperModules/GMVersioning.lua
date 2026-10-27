@@ -592,6 +592,28 @@ local function defineProfiles()
         {
           x86 =
           {
+            variants =
+            {
+              {
+                name = 'gms2-2.3+',
+                membersOffset = 0x80,
+                flinkRelative = 0xC8,
+                objectOffset = 0x70,
+                sequenceOffsetShift = 0
+              },
+              {
+                -- GMS2 2.2 has no sequence-position triplet at the beginning of CInstanceInternal.
+                -- built-in getters in this generation expose ID@+0x78, X@+0xA0 and the active-list link at +0x130
+                -- variable access checks the slot domain at YYObjectBase+0x30; this revision doesnt expose a separate capacity
+                name = 'gms2-2.2',
+                membersOffset = 0x74,
+                flinkRelative = 0xBC,
+                objectOffset = 0x68,
+                sequenceOffsetShift = -0x0C,
+                variableCountOffset = 0x30,
+                variableCapacityOffset = 0x30
+              }
+            },
             membersOffsets = { 0x80 },
             flinkRelatives = { 0xC8 },
             objectOffset = 0x70,

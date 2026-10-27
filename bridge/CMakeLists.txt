@@ -23,45 +23,24 @@ set( ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE )
 set( ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE )
 set( ZYDIS_BUILD_DOXYGEN OFF CACHE BOOL "" FORCE )
 
-set( LOCAL_MINHOOK "${CMAKE_CURRENT_SOURCE_DIR}/../../PRIVATE_ceUEDumper/bridge/build/_deps/minhook-src" )
-set( LOCAL_YYTK_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../../YYToolkit-stable/YYToolkit/include" )
+FetchContent_Declare(minhook
+  GIT_REPOSITORY https://github.com/TsudaKageyu/minhook.git
+  GIT_TAG 8af6b4acae5a9388fd742b56fa79ece89d96f823
+  UPDATE_DISCONNECTED TRUE
+)
 
-if( EXISTS "${LOCAL_MINHOOK}/CMakeLists.txt" )
+FetchContent_MakeAvailable(minhook)
 
-  add_subdirectory(
-                    "${LOCAL_MINHOOK}"
-                    "${CMAKE_CURRENT_BINARY_DIR}/local-minhook"
-                  )
+FetchContent_Declare(zydis
+  GIT_REPOSITORY https://github.com/zyantific/zydis.git
+  GIT_TAG v4.1.1
+  GIT_SHALLOW TRUE
+  UPDATE_DISCONNECTED TRUE
+)
 
-else()
+FetchContent_MakeAvailable(zydis)
 
-  FetchContent_Declare(minhook
-    GIT_REPOSITORY https://github.com/TsudaKageyu/minhook.git
-    GIT_TAG 8af6b4acae5a9388fd742b56fa79ece89d96f823
-    GIT_SHALLOW TRUE
-  )
-
-  FetchContent_MakeAvailable(minhook)
-endif()
-
-if( EXISTS "${LOCAL_YYTK_INCLUDE}/Zydis/Zydis.c" )
-  
-  add_library( GMDumperZydis STATIC "${LOCAL_YYTK_INCLUDE}/Zydis/Zydis.c" )
-  
-  target_include_directories( GMDumperZydis PUBLIC "${LOCAL_YYTK_INCLUDE}" )
-else()
-
-  FetchContent_Declare(zydis
-    GIT_REPOSITORY https://github.com/zyantific/zydis.git
-    GIT_TAG v4.1.1
-    GIT_SHALLOW TRUE
-  )
-
-  FetchContent_MakeAvailable(zydis)
-
-  add_library(GMDumperZydis ALIAS Zydis)
-
-endif()
+add_library(GMDumperZydis ALIAS Zydis)
 
 add_library( GMDumperBridge SHARED src/Bridge.cpp )
 

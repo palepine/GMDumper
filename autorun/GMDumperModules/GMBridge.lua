@@ -742,7 +742,12 @@ function Bridge.configure(codeExecute, reflection, arrayEquals, arrayLength, scr
     return nil, Bridge.lastError()
   end
 
-  -- explicit addresses win. Otherwise the profile decides if structural scan is supported for this runner
+  local discoveryError
+
+  -- Explicit addresses win
+  -- otherwise try structural interface discovery
+  -- failure isnt terminal when the runner exposes the older member-name built-ins.
+  -- x86 GMS2 can reflect through their validated dictionary walk without StructGetMember/StructGetKeys.
   if reflection
      and reflection.yyGetString
      and reflection.freeRValue
@@ -774,10 +779,10 @@ function Bridge.configure(codeExecute, reflection, arrayEquals, arrayLength, scr
     if Bridge.call( 'gmd_configure_reflection', reflection.structGetKeys, reflection.structGetMember ) ~= 1 then return nil, Bridge.lastError() end
 
   elseif profile.automatic == false then
-    return nil, ('Bridge profile %s doesnt support autoscan for this arch; configure StructGetKeys/StructGetMember manually'):format( tostring(profile.id or 'unknown') )
+    discoveryError = ('Bridge profile %s doesnt support autoscan for this arch; configure StructGetKeys/StructGetMember manually'):format( tostring(profile.id or 'unknown') )
   
   elseif Bridge.call( 'gmd_discover_reflection' ) ~= 1 then
-    return nil, Bridge.lastError()
+    discoveryError = Bridge.lastError()
   end
 
   local directKeys = Bridge.call( 'gmd_get_struct_get_keys' )
@@ -791,9 +796,11 @@ function Bridge.configure(codeExecute, reflection, arrayEquals, arrayLength, scr
   -- old runner interfaces can have executable functions at the newer StructGetMember/StructGetKeys slot numbers
   -- runtime invocation reveals that they are not reflection functions.
   -- The bridge falls back on the game thread when that probe returns zero / fails validation.
-  if memberGetNames and memberNamesCount then
+  -- GMS2 2.2 exposes get-names without a count routine
+  -- its x86 bridge discovers the built-in's terminating dictionary iterator instead.
+  if memberGetNames then
 
-    if Bridge.call( 'gmd_configure_member_fallback', memberGetNames, memberNamesCount ) == 1 then
+    if Bridge.call( 'gmd_configure_member_fallback', memberGetNames, memberNamesCount or 0 ) == 1 then
       Bridge.State.memberFallbackConfigured = true
     else
       Bridge.State.memberFallbackError = Bridge.lastError()
@@ -802,7 +809,17 @@ function Bridge.configure(codeExecute, reflection, arrayEquals, arrayLength, scr
   end
 
   if not directAvailable and not Bridge.State.memberFallbackConfigured then
-    return nil, Bridge.State.memberFallbackError or 'Runner lacks direct reflection & member-name built-ins'
+    local errors = {}
+
+    if discoveryError then
+      errors[ #errors + 1 ] = discoveryError
+    end
+    
+    if Bridge.State.memberFallbackError then
+      errors[ #errors + 1 ] = Bridge.State.memberFallbackError
+    end
+
+    return nil, #errors > 0 and table.concat(errors, '; ') or 'Runner lacks direct reflection & member-name built-ins'
   end
 
   -- install dispatcher after reflection is available

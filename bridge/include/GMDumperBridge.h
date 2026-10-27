@@ -100,8 +100,10 @@ GMD_API std::uint32_t gmd_configure_cached_interface(
 
 /// Configure built-in member-name enumeration used by older interfaces.
 ///
-/// Names are converted to runtime slots through the bridge-discovered Code_Variable_FindAlloc_Slot_From_Name routine.
-/// retained as a validation fallback when older interface has unrelated executable functions at newer reflection slot offsets.
+/// Names are paired with runtime slots through a validated member-dictionary walk on x86,
+/// or through the recovered name-to-slot helper when available.
+/// names_count may be null on iterator-backed GMS2 2.2 and earlier runners.
+/// It remains usable when an older interface has no direct StructGet* slots.
 GMD_API std::uint32_t gmd_configure_member_fallback(void* get_names, void* names_count);
 
 /// Configure array helpers and infer DynamicArrayOfRValue element storage.

@@ -2307,12 +2307,12 @@ end
 --- Validate a candidate CObjectGM pointer in an instance
 -- @param state table
 -- @param instance table
--- @param membersOffset number
-local function plausibleObjectAt(state, instance, membersOffset)
-  -- m_Object precedes version-dependent CInstanceInternal union and doesnt move when SequenceInstance/SkeletonMask fields are added to that union
-  -- YYToolkit's classic x64 YYObjectBase is 0x88, followed by create-counter, placing m_Object at 0x90 for every A8/B0/B8 member variant
+-- @param objectOffset number|nil
+local function plausibleObjectAt(state, instance, objectOffset)
+  -- m_Object precedes the version-dependent CInstanceInternal union.
+  -- Modern member variants keep it fixed; pre-2.3 x86 uses a smaller YYObjectBase and supplies its own variant offset.
 
-  local objectOffset = state.profile.layouts.instance.objectOffset
+  objectOffset = objectOffset or state.profile.layouts.instance.objectOffset
   
   local object = readPtr( instance + objectOffset )
   if not object or object == 0 then return nil end
@@ -2332,13 +2332,19 @@ local function finiteMotionNumber(value)
   return type(value) == 'number' and value == value and math.abs(value) < 1000000000
 end
 
---- CInstanceInternal can be 4-byte field in some builds after imageScaleY linked-list pointer remains at the same aligned offset
-local function selectMotionOffsetShift(state, list, membersOffset, flinkRelative)
+--- Select the small motion-field displacement used by some CInstanceInternal layouts
+-- @param state table
+-- @param list table
+-- @param membersOffset number
+-- @param flinkRelative number
+-- @param sequenceOffsetShift number|nil
+local function selectMotionOffsetShift(state, list, membersOffset, flinkRelative, sequenceOffsetShift)
   if type(state.options.instanceMotionOffsetShift) == 'number' then
     return state.options.instanceMotionOffsetShift, { explicit = state.options.instanceMotionOffsetShift }
   end
 
   local candidates = state.profile.layouts.instance.motionShifts
+  local sequenceShift = sequenceOffsetShift or 0
   local scores, current, sampled = {}, list.first, 0
 
   for _, shift in ipairs(candidates) do scores[shift] = 0 end
@@ -2350,11 +2356,11 @@ local function selectMotionOffsetShift(state, list, membersOffset, flinkRelative
 
     for _, shift in ipairs(candidates) do
 
-      local angle = readF32( base + 0x2C + shift )
-      local alpha = readF32( base + 0x30 + shift )
-      local x, y = readF32( base + 0x38 + shift ), readF32( base + 0x3C + shift )
+      local angle = readF32( base + 0x2C + sequenceShift + shift )
+      local alpha = readF32( base + 0x30 + sequenceShift + shift )
+      local x, y = readF32( base + 0x38 + sequenceShift + shift ), readF32( base + 0x3C + sequenceShift + shift )
 
-      local previousX, previousY = readF32( base + 0x48 + shift ), readF32( base + 0x4C + shift )
+      local previousX, previousY = readF32( base + 0x48 + sequenceShift + shift ), readF32( base + 0x4C + sequenceShift + shift )
 
       if finiteMotionNumber(angle)
          and finiteMotionNumber(alpha)
@@ -2396,7 +2402,10 @@ end
 -- @param list table
 -- @param membersOffset number
 -- @param flinkRelative number
-local function validateInstanceLayout(state, list, membersOffset, flinkRelative)
+-- @param objectOffset number|nil
+-- @param sequenceOffsetShift number|nil
+-- @param variantName string|nil
+local function validateInstanceLayout(state, list, membersOffset, flinkRelative, objectOffset, sequenceOffsetShift, variantName)
   if list.count == 0 then return nil end
 
   local current, visited, final = list.first, 0, 0
@@ -2405,7 +2414,7 @@ local function validateInstanceLayout(state, list, membersOffset, flinkRelative)
   -- The list is accepted only when traversal count, final node, and null tail all agree with the room header
   while current and current ~= 0 and visited < limit do
 
-    if visited < 8 and not plausibleObjectAt( state, current, membersOffset ) then return nil end
+    if visited < 8 and not plausibleObjectAt( state, current, objectOffset ) then return nil end
 
     local id = readI32( current + membersOffset + 4 )
 
@@ -2420,16 +2429,23 @@ local function validateInstanceLayout(state, list, membersOffset, flinkRelative)
 
   if visited ~= list.count or final ~= list.last or (current or 0) ~= 0 then return nil end
 
-  local _, _, objectOffset = plausibleObjectAt( state, list.first, membersOffset )
+  local _, _, selectedObjectOffset = plausibleObjectAt( state, list.first, objectOffset )
 
-  local motionOffsetShift, motionValidationScores = selectMotionOffsetShift( state, list, membersOffset, flinkRelative )
+  local motionOffsetShift, motionValidationScores = selectMotionOffsetShift(
+                                                                            state,
+                                                                            list,
+                                                                            membersOffset,
+                                                                            flinkRelative,
+                                                                            sequenceOffsetShift
+                                                                          )
 
   return
   {
-    name = ('CInstance.members@%X'):format(membersOffset),
+    name = variantName or ('CInstance.members@%X'):format(membersOffset),
     membersOffset = membersOffset,
     flinkOffset = membersOffset + flinkRelative,
-    objectOffset = objectOffset,
+    objectOffset = selectedObjectOffset,
+    sequenceOffsetShift = sequenceOffsetShift or 0,
     motionOffsetShift = motionOffsetShift,
     motionValidationScores = motionValidationScores,
     validated = true
@@ -2492,6 +2508,33 @@ local function selectInstanceLayout(state, list)
     local layout = validateDirectInstanceLayout( state, list, candidate )
     if layout then return layout end
   end
+
+  -- Named variants keep offsets that changed together in 1 runner generation coupled during validation.
+  -- that is to avoid accepting a coincidental cross-product of an old member header with a newer object or list-link offset.
+  for _, candidate in ipairs( state.profile.layouts.instance.variants or {} ) do
+
+    local layout = validateInstanceLayout(
+                                           state,
+                                           list,
+                                           candidate.membersOffset,
+                                           candidate.flinkRelative,
+                                           candidate.objectOffset,
+                                           candidate.sequenceOffsetShift,
+                                           candidate.name
+                                         )
+    if layout then
+
+      -- storage offsets are part of the same generation proof as the CInstance header.
+      -- preserve only explicit overrides
+      -- the reader falls back to the profile-wide YYObjectBase layout for all other variants
+      layout.yyVarsOffset = candidate.yyVarsOffset
+      layout.variableMapOffset = candidate.variableMapOffset
+      layout.variableCountOffset = candidate.variableCountOffset
+      layout.variableCapacityOffset = candidate.variableCapacityOffset
+
+      return layout
+    end
+  end
   
   if type(state.options.instanceMembersOffset) == 'number' then
     
@@ -2502,7 +2545,14 @@ local function selectInstanceLayout(state, list)
     end
 
     relative = relative or state.profile.layouts.instance.flinkRelatives[1]
-    return validateInstanceLayout( state, list, state.options.instanceMembersOffset, relative )
+    return validateInstanceLayout(
+                                   state,
+                                   list,
+                                   state.options.instanceMembersOffset,
+                                   relative,
+                                   state.options.instanceObjectOffset,
+                                   state.options.instanceSequenceOffsetShift
+                                 )
   end
 
   local flinkRelatives = state.profile.layouts.instance.flinkRelatives
@@ -2915,10 +2965,19 @@ local function readInstanceHeader(state, address, layout)
     }
   end
 
-  local object, objectName = plausibleObjectAt( state, address, layout.membersOffset )
+  local object, objectName = plausibleObjectAt( state, address, layout.objectOffset )
   if not object then return nil end
 
   local instanceProfile = state.profile.layouts.instance
+  local sequenceShift = layout.sequenceOffsetShift or 0
+  local motionShift = layout.motionOffsetShift or 0
+
+  -- instance-layout variant may also identify a generation-specific YYObjectBase prefix.
+  -- keep overrides coupled to the structural layout that proved them
+  local yyVarsOffset = layout.yyVarsOffset or instanceProfile.yyVarsOffset
+  local variableMapOffset = layout.variableMapOffset or instanceProfile.variableMapOffset
+  local variableCountOffset = layout.variableCountOffset or instanceProfile.variableCountOffset
+  local variableCapacityOffset = layout.variableCapacityOffset or instanceProfile.variableCapacityOffset
 
   return
   {
@@ -2928,12 +2987,12 @@ local function readInstanceHeader(state, address, layout)
     spriteIndex = readI32( address + layout.membersOffset + 12 ),
     object = object,
     objectName = objectName,
-    yyVars = readPtr( address + instanceProfile.yyVarsOffset ),
-    variableMap = readPtr( address + instanceProfile.variableMapOffset ),
-    variableCount = readI32( address + instanceProfile.variableCountOffset ),
-    variableCapacity = readI32( address + instanceProfile.variableCapacityOffset ),
-    x = readF32( address + layout.membersOffset + 0x38 + (layout.motionOffsetShift or 0) ),
-    y = readF32( address + layout.membersOffset + 0x3C + (layout.motionOffsetShift or 0) )
+    yyVars = readPtr( address + yyVarsOffset ),
+    variableMap = readPtr( address + variableMapOffset ),
+    variableCount = readI32( address + variableCountOffset ),
+    variableCapacity = readI32( address + variableCapacityOffset ),
+    x = readF32( address + layout.membersOffset + 0x38 + sequenceShift + motionShift ),
+    y = readF32( address + layout.membersOffset + 0x3C + sequenceShift + motionShift )
   }
 end
 
@@ -3501,11 +3560,17 @@ function Runtime.Globals.instance(state)
   local instanceProfile = state.profile and state.profile.layouts and state.profile.layouts.instance
   if not instanceProfile then return nil, 'global YYObjectBase profile unavailable' end
 
+  local instanceLayout = state.instances and state.instances.instanceLayout
+  local yyVarsOffset = instanceLayout and instanceLayout.yyVarsOffset or instanceProfile.yyVarsOffset
+  local variableMapOffset = instanceLayout and instanceLayout.variableMapOffset or instanceProfile.variableMapOffset
+  local variableCountOffset = instanceLayout and instanceLayout.variableCountOffset or instanceProfile.variableCountOffset
+  local variableCapacityOffset = instanceLayout and instanceLayout.variableCapacityOffset or instanceProfile.variableCapacityOffset
+
   local function header(address)
     if not address or address == 0 then return nil end
 
-    local count = readI32( address + instanceProfile.variableCountOffset )
-    local capacity = readI32( address + instanceProfile.variableCapacityOffset )
+    local count = readI32( address + variableCountOffset )
+    local capacity = readI32( address + variableCapacityOffset )
 
     if not count or count < 0 or count > 1000000 then return nil end
     if not capacity or capacity < count or capacity > 10000000 then return nil end
@@ -3516,8 +3581,8 @@ function Runtime.Globals.instance(state)
       id = -5,
       object = address,
       objectName = 'global',
-      yyVars = readPtr( address + instanceProfile.yyVarsOffset ),
-      variableMap = readPtr( address + instanceProfile.variableMapOffset ),
+      yyVars = readPtr( address + yyVarsOffset ),
+      variableMap = readPtr( address + variableMapOffset ),
       variableCount = count,
       variableCapacity = capacity,
       globalScope = true,
@@ -4478,17 +4543,21 @@ function Runtime.Structures.createInstanceLayouts(state)
 
   local yyObject = createStructure('YYObjectBase')
   local instanceProfile = state.profile.layouts.instance
+  local yyVarsOffset = instanceLayout and instanceLayout.yyVarsOffset or instanceProfile.yyVarsOffset
+  local variableMapOffset = instanceLayout and instanceLayout.variableMapOffset or instanceProfile.variableMapOffset
+  local variableCountOffset = instanceLayout and instanceLayout.variableCountOffset or instanceProfile.variableCountOffset
+  local variableCapacityOffset = instanceLayout and instanceLayout.variableCapacityOffset or instanceProfile.variableCapacityOffset
 
   field( yyObject, 'vTable', 0, vtPointer )
-  field( yyObject, ('DenseYYVars (optional; first %d slots)'):format( rawSlotCount ), instanceProfile.yyVarsOffset, vtPointer, rawSlots )
+  field( yyObject, ('DenseYYVars (optional; first %d slots)'):format( rawSlotCount ), yyVarsOffset, vtPointer, rawSlots )
   field( yyObject, 'ObjectListNext', instanceProfile.objectListNextOffset, vtPointer, yyObject )
   field( yyObject, 'ObjectListPrev', instanceProfile.objectListPreviousOffset, vtPointer, yyObject )
   field( yyObject, 'Prototype', instanceProfile.prototypeOffset, vtPointer, yyObject )
   field( yyObject, 'ClassName', instanceProfile.classNameOffset, vtPointer, cString )
-  field( yyObject, 'SparseYYVarsMap', instanceProfile.variableMapOffset, vtPointer, variableMap )
-  field( yyObject, 'VariableSlotCount', instanceProfile.variableCountOffset, vtDword )
+  field( yyObject, 'SparseYYVarsMap', variableMapOffset, vtPointer, variableMap )
+  field( yyObject, 'VariableSlotCount', variableCountOffset, vtDword )
   field( yyObject, 'ObjectFlags', instanceProfile.objectFlagsOffset, vtDword )
-  field( yyObject, 'VariableSlotCapacity', instanceProfile.variableCapacityOffset, vtDword )
+  field( yyObject, 'VariableSlotCapacity', variableCapacityOffset, vtDword )
   field( yyObject, 'ObjectKind', instanceProfile.objectKindOffset, vtDword )
 
   local result =
@@ -4518,22 +4587,24 @@ function Runtime.Structures.createInstanceLayouts(state)
 
     local instance = createStructure( ('CInstance.%X'):format( instanceLayout.membersOffset ) )
     field( instance, 'vTable', 0, vtPointer )
-    field( instance, ('DenseYYVars (optional; first %d slots)'):format( rawSlotCount ), instanceProfile.yyVarsOffset, vtPointer, rawSlots )
+    field( instance, ('DenseYYVars (optional; first %d slots)'):format( rawSlotCount ), yyVarsOffset, vtPointer, rawSlots )
     field( instance, 'Prototype', instanceProfile.prototypeOffset, vtPointer, yyObject )
     field( instance, 'ClassName', instanceProfile.classNameOffset, vtPointer, cString )
-    field( instance, 'SparseYYVarsMap', instanceProfile.variableMapOffset, vtPointer, variableMap )
-    field( instance, 'VariableSlotCount', instanceProfile.variableCountOffset, vtDword )
-    field( instance, 'VariableSlotCapacity', instanceProfile.variableCapacityOffset, vtDword )
+    field( instance, 'SparseYYVarsMap', variableMapOffset, vtPointer, variableMap )
+    field( instance, 'VariableSlotCount', variableCountOffset, vtDword )
+    field( instance, 'VariableSlotCapacity', variableCapacityOffset, vtDword )
     field( instance, 'Object', instanceLayout.objectOffset, vtPointer, object )
     field( instance, 'InstanceID', instanceLayout.membersOffset + 4, vtDword ).DisplayMethod = 'dtSignedInteger'
     field( instance, 'ObjectIndex', instanceLayout.membersOffset + 8, vtDword ).DisplayMethod = 'dtSignedInteger'
     field( instance, 'SpriteIndex', instanceLayout.membersOffset + 0xC, vtDword ).DisplayMethod = 'dtSignedInteger'
-    field( instance, 'ImageIndex', instanceLayout.membersOffset + 0x1C, vtSingle )
-    field( instance, 'ImageSpeed', instanceLayout.membersOffset + 0x20, vtSingle )
-    field( instance, 'ImageScaleX', instanceLayout.membersOffset + 0x24, vtSingle )
-    field( instance, 'ImageScaleY', instanceLayout.membersOffset + 0x28, vtSingle )
 
-    local motionShift = instanceLayout.motionOffsetShift or 0
+    local sequenceShift = instanceLayout.sequenceOffsetShift or 0
+    field( instance, 'ImageIndex', instanceLayout.membersOffset + 0x1C + sequenceShift, vtSingle )
+    field( instance, 'ImageSpeed', instanceLayout.membersOffset + 0x20 + sequenceShift, vtSingle )
+    field( instance, 'ImageScaleX', instanceLayout.membersOffset + 0x24 + sequenceShift, vtSingle )
+    field( instance, 'ImageScaleY', instanceLayout.membersOffset + 0x28 + sequenceShift, vtSingle )
+
+    local motionShift = sequenceShift + (instanceLayout.motionOffsetShift or 0)
     field( instance, 'ImageAngle', instanceLayout.membersOffset + 0x2C + motionShift, vtSingle )
     field( instance, 'ImageAlpha', instanceLayout.membersOffset + 0x30 + motionShift, vtSingle )
     field( instance, 'ImageBlend', instanceLayout.membersOffset + 0x34 + motionShift, vtDword )

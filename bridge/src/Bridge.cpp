@@ -229,6 +229,10 @@ namespace gmd::bridge::detail
   // variable_instance_get_names routine obtains each name from object's member dictionary with this internal helper
   using VariableNameFromSlot = const char* (__cdecl*)( int, int, int );
 
+  // GMS2 2.2 and earlier expose the same dictionary only through an iterator used by variable_instance_get_names
+  // The iterator advances two caller-owned cursors & returns a pointer to the current value entry (or null after the final entry).
+  using MemberDictionaryIterator = void* (__thiscall*)( void*, int*, int* );
+
 #endif
 
   using ScriptFindId = int (*)( const char* );
@@ -357,6 +361,10 @@ namespace gmd::bridge::detail
 
   std::atomic< VariableNameFromSlot > g_variable_name_from_slot{};
 
+  std::atomic< MemberDictionaryIterator > g_member_dictionary_iterator{};
+
+  std::atomic< std::int32_t > g_member_dictionary_variable_base{};
+
   std::atomic< std::int32_t > g_member_dictionary_offset{ -1 };
 
   std::atomic< std::int32_t > g_member_dictionary_entries_offset{ -1 };
@@ -364,6 +372,12 @@ namespace gmd::bridge::detail
   std::atomic< std::int32_t > g_member_dictionary_slot_offset{ -1 };
 
   std::atomic< std::int32_t > g_member_dictionary_state_offset{ -1 };
+
+  std::atomic< std::int32_t > g_member_dictionary_count_offset{};
+
+  std::atomic< std::int32_t > g_member_dictionary_mask_offset{ -1 };
+
+  std::atomic< bool > g_member_dictionary_hash_state{};
 
 #endif
 
@@ -801,9 +815,13 @@ namespace gmd::bridge::detail
   ///
   /// they dont expose StructGetMember API, YYRunnerInterface slot historically used to infer a name-to-slot helper isnt stable.
   /// public get-names built-in seemingly more reliable: its loop reads each live dictionary entry's slot, converts it to a name.
-  bool discover_x86_member_dictionary(Routine get_names)
+  bool discover_x86_member_dictionary(Routine get_names, Routine names_count)
   {
     g_variable_name_from_slot.store( nullptr, std::memory_order_release );
+
+    g_member_dictionary_iterator.store( nullptr, std::memory_order_release );
+
+    g_member_dictionary_variable_base.store( 0, std::memory_order_release );
 
     g_member_dictionary_offset.store( -1, std::memory_order_release );
 
@@ -812,6 +830,12 @@ namespace gmd::bridge::detail
     g_member_dictionary_slot_offset.store( -1, std::memory_order_release );
 
     g_member_dictionary_state_offset.store( -1, std::memory_order_release );
+
+    g_member_dictionary_count_offset.store( 0, std::memory_order_release );
+
+    g_member_dictionary_mask_offset.store( -1, std::memory_order_release );
+
+    g_member_dictionary_hash_state.store( false, std::memory_order_release );
 
     if ( !executable_pointer( reinterpret_cast< void* >( get_names ) ) )
     {
@@ -827,6 +851,145 @@ namespace gmd::bridge::detail
 
     __try
     {
+      // GMS2 2.2 & earlier use an iterator instead of exposing the dictionary's entry array
+      // Recognize the complete operation:
+      //   map = object->members
+      //   entry = iterate(map, &cursor_a, &cursor_b)
+      //   name = name_from_slot(0, -1, cursor_b + variable_base)
+      // This generation has variable_instance_get_names but no separate count built-in.
+      for (std::size_t header = 0; header + 8 < 0x180; ++header)
+      {
+        if (
+             code[ header + 0 ] != 0x8B ||
+             code[ header + 1 ] != 0x4B ||
+             code[ header + 3 ] != 0x85 ||
+             code[ header + 4 ] != 0xC9
+           )
+        {
+          continue;
+        }
+
+        const auto dictionary_offset = static_cast< std::int32_t >( code[ header + 2 ] );
+
+        if ( dictionary_offset <= 0 || dictionary_offset > 0x100 )
+        {
+          continue;
+        }
+
+        MemberDictionaryIterator iterator{};
+
+        for (std::size_t cursor = header + 5; cursor + 24 < std::min<std::size_t>( header + 0x80, 0x200 ); ++cursor)
+        {
+          std::size_t call_offset{};
+
+          // Optimized builds either emit the two LEA/PUSH pairs contiguously or initialize each cursor between its LEA and PUSH.
+          if (
+               code[ cursor + 0 ] == 0x8D &&
+               code[ cursor + 1 ] == 0x44 &&
+               code[ cursor + 2 ] == 0x24 &&
+               code[ cursor + 4 ] == 0x50 &&
+               code[ cursor + 5 ] == 0x8D &&
+               code[ cursor + 6 ] == 0x44 &&
+               code[ cursor + 7 ] == 0x24 &&
+               code[ cursor + 9 ] == 0x50 &&
+               code[ cursor + 10 ] == 0xE8
+             )
+          {
+            call_offset = cursor + 10;
+          }
+          else if (
+                    code[ cursor + 0 ] == 0x8D &&
+                    code[ cursor + 1 ] == 0x44 &&
+                    code[ cursor + 2 ] == 0x24 &&
+                    code[ cursor + 4 ] == 0x89 &&
+                    code[ cursor + 5 ] == 0x6C &&
+                    code[ cursor + 6 ] == 0x24 &&
+                    code[ cursor + 8 ] == 0x50 &&
+                    code[ cursor + 9 ] == 0x8D &&
+                    code[ cursor + 10 ] == 0x44 &&
+                    code[ cursor + 11 ] == 0x24 &&
+                    code[ cursor + 13 ] == 0x89 &&
+                    code[ cursor + 14 ] == 0x6C &&
+                    code[ cursor + 15 ] == 0x24 &&
+                    code[ cursor + 17 ] == 0x50 &&
+                    code[ cursor + 18 ] == 0xE8
+                  )
+          {
+            call_offset = cursor + 18;
+          }
+
+          if (call_offset)
+          {
+            std::int32_t relative{};
+
+            std::memcpy( &relative, code + call_offset + 1, sizeof(relative) );
+
+            iterator = reinterpret_cast< MemberDictionaryIterator >( const_cast< std::uint8_t* >( code + call_offset + 5 + relative ) );
+            break;
+          }
+        }
+
+        if ( !iterator || !executable_pointer( reinterpret_cast<void*>(iterator) ) )
+        {
+          continue;
+        }
+
+        VariableNameFromSlot name_from_slot{};
+        std::int32_t variable_base{};
+
+        for (std::size_t cursor = header + 5; cursor + 19 < std::min<std::size_t>( header + 0x100, 0x240 ); ++cursor)
+        {
+          if (
+                code[ cursor + 0 ] != 0x8B ||
+                code[ cursor + 1 ] != 0x44 ||
+                code[ cursor + 2 ] != 0x24 ||
+                code[ cursor + 4 ] != 0x05 ||
+                code[ cursor + 9 ] != 0x50
+              )
+          {
+            continue;
+          }
+
+          std::size_t zero_push{};
+
+          if ( code[ cursor + 10 ] == 0x6A && code[ cursor + 11 ] == 0xFF )
+          {
+            zero_push = cursor + 12;
+          }
+          else if ( code[ cursor + 10 ] >= 0x50 && code[ cursor + 10 ] <= 0x57 )
+          {
+            zero_push = cursor + 11;
+          }
+
+          if ( zero_push && code[ zero_push ] == 0x6A && code[ zero_push + 1 ] == 0x00 && code[ zero_push + 2 ] == 0xE8 )
+          {
+            std::int32_t relative{};
+
+            std::memcpy( &variable_base, code + cursor + 5, sizeof( variable_base ) );
+
+            std::memcpy( &relative, code + zero_push + 3, sizeof( relative ) );
+
+            name_from_slot = reinterpret_cast< VariableNameFromSlot >( const_cast< std::uint8_t* >( code + zero_push + 7 + relative ) );
+            break;
+          }
+        }
+
+        if ( !name_from_slot || !executable_pointer( reinterpret_cast<void*>(name_from_slot) ) || variable_base < 0 || variable_base > 10000000 )
+        {
+          continue;
+        }
+
+        g_member_dictionary_offset.store( dictionary_offset, std::memory_order_release );
+
+        g_member_dictionary_iterator.store( iterator, std::memory_order_release );
+
+        g_member_dictionary_variable_base.store( variable_base, std::memory_order_release );
+
+        g_variable_name_from_slot.store( name_from_slot, std::memory_order_release );
+
+        return true;
+      }
+
       for (std::size_t header = 0; header + 15 < 0x180; ++header)
       {
         // mov ecx,[ebx+dictionary]
@@ -921,9 +1084,110 @@ namespace gmd::bridge::detail
 
         g_member_dictionary_state_offset.store( state_offset, std::memory_order_release );
 
+        g_member_dictionary_count_offset.store( 0, std::memory_order_release );
+
+        g_member_dictionary_mask_offset.store( -1, std::memory_order_release );
+
+        g_member_dictionary_hash_state.store( false, std::memory_order_release );
+
         g_variable_name_from_slot.store( name_from_slot, std::memory_order_release );
 
         return true;
+      }
+
+      // GMS2 2.3 x86 walks the same sparse map through iterator helpers rather
+      // than inlining the newer dictionary loop.  Prove this generation with
+      // two independent public built-ins:
+      //   get_names   loads [object+map] and calls name_from_slot(0,-1,slot)
+      //   names_count loads [object+map] and returns [map+used_count]
+      const auto* count_code = static_cast< const std::uint8_t* >( follow_direct_jumps( reinterpret_cast<void*>(names_count) ) );
+
+      if ( count_code )
+      {
+        for (std::size_t header = 0; header + 8 < 0x180; ++header)
+        {
+          if (
+               code[ header + 0 ] != 0x8B ||
+               code[ header + 1 ] != 0x4B ||
+               code[ header + 3 ] != 0x85 ||
+               code[ header + 4 ] != 0xC9
+             )
+          {
+            continue;
+          }
+
+          const auto dictionary_offset = static_cast< std::int32_t >( code[ header + 2 ] );
+
+          if ( dictionary_offset <= 0 || dictionary_offset > 0x100 )
+          {
+            continue;
+          }
+
+          constexpr std::int32_t CountOffset = 0x04;
+          auto count_shape_valid = false;
+
+          for (std::size_t cursor = 0; cursor + 10 < 0x100; ++cursor)
+          {
+            if (
+                 count_code[ cursor + 0 ] == 0x8B &&
+                 count_code[ cursor + 1 ] == 0x40 &&
+                 count_code[ cursor + 2 ] == dictionary_offset
+               )
+            {
+              for (std::size_t count_cursor = cursor + 3; count_cursor + 5 < std::min<std::size_t>( cursor + 0x30, 0x100 ); ++count_cursor)
+              {
+                if (
+                     count_code[ count_cursor + 0 ] == 0x66 &&
+                     count_code[ count_cursor + 1 ] == 0x0F &&
+                     count_code[ count_cursor + 2 ] == 0x6E &&
+                     count_code[ count_cursor + 3 ] == 0x40 &&
+                     count_code[ count_cursor + 4 ] == CountOffset
+                   )
+                {
+                  count_shape_valid = true;
+                  break;
+                }
+              }
+            }
+
+            if (count_shape_valid) break;
+          }
+
+          if (!count_shape_valid) continue;
+
+          VariableNameFromSlot name_from_slot{};
+
+          for (std::size_t cursor = header + 5; cursor + 12 < std::min<std::size_t>( header + 0xA0, 0x200 ); ++cursor)
+          {
+            if (
+                 code[ cursor + 0 ] == 0xFF &&
+                 code[ cursor + 1 ] == 0x75 &&
+                 code[ cursor + 3 ] == 0x6A &&
+                 code[ cursor + 4 ] == 0xFF &&
+                 code[ cursor + 5 ] == 0x6A &&
+                 code[ cursor + 6 ] == 0x00 &&
+                 code[ cursor + 7 ] == 0xE8
+               )
+            {
+              std::int32_t relative{};
+              std::memcpy( &relative, code + cursor + 8, sizeof(relative) );
+              name_from_slot = reinterpret_cast< VariableNameFromSlot >( const_cast<std::uint8_t*>( code + cursor + 12 + relative ) );
+              break;
+            }
+          }
+
+          if ( !name_from_slot || !executable_pointer( reinterpret_cast<void*>(name_from_slot) ) ) continue;
+
+          g_member_dictionary_offset.store( dictionary_offset, std::memory_order_release );
+          g_member_dictionary_entries_offset.store( 0x10, std::memory_order_release );
+          g_member_dictionary_slot_offset.store( 0x04, std::memory_order_release );
+          g_member_dictionary_state_offset.store( 0x08, std::memory_order_release );
+          g_member_dictionary_count_offset.store( CountOffset, std::memory_order_release );
+          g_member_dictionary_mask_offset.store( 0x08, std::memory_order_release );
+          g_member_dictionary_hash_state.store( true, std::memory_order_release );
+          g_variable_name_from_slot.store( name_from_slot, std::memory_order_release );
+          return true;
+        }
       }
     }
     __except ( EXCEPTION_EXECUTE_HANDLER )
@@ -2101,6 +2365,159 @@ namespace gmd::bridge::detail
     }
   }
 
+  bool call_member_iterator(MemberDictionaryIterator function, void* dictionary, int &cursor_a, int &cursor_b, void* &entry)
+  {
+    __try
+    {
+      entry = function( dictionary, &cursor_a, &cursor_b );
+      return true;
+    }
+    __except ( EXCEPTION_EXECUTE_HANDLER )
+    {
+      return false;
+    }
+  }
+
+  /// Enumerate the iterator-backed member dictionary used by GMS2 2.2 & earlier.
+  ///
+  /// performs on the runner thread (dicts can mutate with GML execution)
+  /// The recovered slot is returned without dereferencing the instance RValue map
+  bool execute_members_iterator(Request &request)
+  {
+    const auto iterator = g_member_dictionary_iterator.load( std::memory_order_acquire );
+
+    const auto name_from_slot = g_variable_name_from_slot.load( std::memory_order_acquire );
+
+    const auto dictionary_offset = g_member_dictionary_offset.load( std::memory_order_acquire );
+
+    const auto variable_base = g_member_dictionary_variable_base.load( std::memory_order_acquire );
+
+
+    if ( !iterator || !name_from_slot || dictionary_offset < 0 )
+    {
+      return false;
+    }
+
+    const auto* object = static_cast< const std::uint8_t* >( request.object );
+
+    const std::uint8_t* dictionary{};
+
+    if ( !read_pointer32( object + dictionary_offset, dictionary ) || !dictionary )
+    {
+      request.error = "Object member dictionary is null / unreadable";
+      request.status.store( GmdRequestStatus::Failed, std::memory_order_release );
+      return true;
+    }
+
+    request.members.clear();
+
+    request.members.reserve( std::min<std::uint32_t>( request.maximum, 64 ) );
+
+    std::unordered_set< std::string > seen_names;
+
+    std::unordered_set< int > seen_slots;
+
+    int cursor_a{};
+    int cursor_b{};
+
+    // Sparse dictionaries may visit tombstones. the traversal limit is larger than the accepted-member limit while remaining bounded against corrupt state.
+    const auto traversal_limit = std::min<std::uint32_t>( MaximumMemberLimit * 16, std::max<std::uint32_t>( request.maximum * 16, 256 ) );
+
+    for (std::uint32_t iteration = 0; iteration < traversal_limit; ++iteration)
+    {
+      void* entry{};
+
+      if ( !call_member_iterator( iterator, const_cast<std::uint8_t*>(dictionary), cursor_a, cursor_b, entry ) )
+      {
+        request.members.clear();
+        request.error = "Object member dictionary iterator raised an exception";
+        request.status.store( GmdRequestStatus::Failed, std::memory_order_release );
+        return true;
+      }
+
+      if (!entry)
+      {
+        request.status.store( GmdRequestStatus::Completed, std::memory_order_release );
+        return true;
+      }
+
+      const std::uint8_t* value{};
+      std::int32_t kind{};
+
+      // Match the runner's own get-names filter: an iterator result points to a value pointer and kind 0x00FFFFFF marks a vacant/tombstone entry.
+      if ( !read_pointer32( entry, value ) || !value || !read_integer32( value + 0x0C, kind ) )
+      {
+        request.members.clear();
+        request.error = "Object member dictionary iterator returned an unreadable entry";
+        request.status.store( GmdRequestStatus::Failed, std::memory_order_release );
+        return true;
+      }
+
+      if ( (kind & 0x00FFFFFF) == 0x00FFFFFF )
+      {
+        continue;
+      }
+
+      // The dictionary key is the raw slot used by YYObjectBase's sparse map.
+      // This runner adds its variable-base constant only while translating the key through Code_Variable_Name
+      // exposing that adjusted lookup ID would prevent CE's raw storage walk from matching the reflected member.
+      const auto raw_slot64 = static_cast< std::int64_t >( cursor_b );
+
+      const auto lookup_slot64 = raw_slot64 + variable_base;
+
+      if (
+           raw_slot64 < 0 ||
+           raw_slot64 > std::numeric_limits< int >::max() ||
+           lookup_slot64 < 0 ||
+           lookup_slot64 > std::numeric_limits< int >::max()
+         )
+      {
+        request.members.clear();
+        request.error = "Object member dictionary iterator returned an invalid slot";
+        request.status.store( GmdRequestStatus::Failed, std::memory_order_release );
+        return true;
+      }
+
+      const auto raw_slot = static_cast< int >( raw_slot64 );
+      
+      const auto lookup_slot = static_cast< int >( lookup_slot64 );
+      
+      const char* name{};
+      
+      GmdMemberRecord record{};
+      record.kind = -1;
+
+      if (
+           !call_variable_name( name_from_slot, lookup_slot, name ) ||
+           !copy_name( name, record.name ) ||
+           !seen_names.emplace( record.name ).second ||
+           !seen_slots.emplace( raw_slot ).second
+         )
+      {
+        request.members.clear();
+        request.error = "Object member dictionary iterator returned an invalid / duplicate slot or name";
+        request.status.store( GmdRequestStatus::Failed, std::memory_order_release );
+        return true;
+      }
+
+      if ( request.members.size() >= request.maximum )
+      {
+        request.members.clear();
+        request.error = "Object member dictionary exceeded the caller policy limit";
+        request.status.store( GmdRequestStatus::Failed, std::memory_order_release );
+        return true;
+      }
+
+      record.slot = raw_slot;
+      request.members.push_back(record);
+    }
+
+    request.members.clear();
+    request.error = "Object member dictionary iterator didnt terminate within its safety limit";
+    request.status.store( GmdRequestStatus::Failed, std::memory_order_release );
+    return true;
+  }
+
   /// Enumerate x86 GMS2 names & runtime slots from the dictionary traversed by variable_instance_get_names.
   ///
   /// Returning slots directly avoids guessing the private name-to-slot helper & decoding temporary GML array produced by the built-in.
@@ -2117,8 +2534,14 @@ namespace gmd::bridge::detail
 
     const auto state_offset = g_member_dictionary_state_offset.load( std::memory_order_acquire );
 
+    const auto count_offset = g_member_dictionary_count_offset.load( std::memory_order_acquire );
 
-    if ( !name_from_slot || dictionary_offset < 0 || entries_offset < 0 || slot_offset < 0 || state_offset < 0 )
+    const auto mask_offset = g_member_dictionary_mask_offset.load( std::memory_order_acquire );
+
+    const auto hash_state = g_member_dictionary_hash_state.load( std::memory_order_acquire );
+
+
+    if ( !name_from_slot || dictionary_offset < 0 || entries_offset < 0 || slot_offset < 0 || state_offset < 0 || count_offset < 0 )
     {
       return false;
     }
@@ -2146,7 +2569,7 @@ namespace gmd::bridge::detail
     const std::uint8_t* entries{};
 
     if (
-         !read_integer32( dictionary, entry_count ) ||
+         !read_integer32( dictionary + count_offset, entry_count ) ||
          !read_pointer32( dictionary + entries_offset, entries ) ||
          entry_count < 0 ||
          entry_count > static_cast< std::int32_t >( MaximumMemberLimit ) ||
@@ -2158,9 +2581,25 @@ namespace gmd::bridge::detail
       return true;
     }
 
+    auto scan_count = entry_count;
+
+    if ( mask_offset >= 0 )
+    {
+      std::int32_t mask{};
+
+      if ( !read_integer32( dictionary + mask_offset, mask ) || mask < 0 || mask >= static_cast< std::int32_t >( MaximumMemberLimit * 16 ) )
+      {
+        request.error = "Object member dictionary mask failed validation";
+        request.status.store( GmdRequestStatus::Failed, std::memory_order_release );
+        return true;
+      }
+
+      scan_count = mask + 1;
+    }
+
     constexpr std::size_t EntryStride = 12;
 
-    for (std::int32_t index = 0; index < entry_count; ++index)
+    for (std::int32_t index = 0; index < scan_count; ++index)
     {
       const auto* entry = entries + static_cast< std::size_t >( index ) * EntryStride;
       std::int32_t state{};
@@ -2173,7 +2612,7 @@ namespace gmd::bridge::detail
         return true;
       }
 
-      if (state <= 0)
+      if ( hash_state ? state == 0 : state <= 0 )
       {
         continue;
       }
@@ -2247,6 +2686,14 @@ namespace gmd::bridge::detail
 #if !defined(_WIN64)
 
     dictionary_available = g_variable_name_from_slot.load( std::memory_order_acquire ) != nullptr;
+
+    // GMS2 2.2 has no names-count built-in.
+    // Its validated iterator supplies the termination condition and therefore must run before the count-based paths.
+    if ( g_member_dictionary_iterator.load( std::memory_order_acquire ) )
+    {
+      execute_members_iterator(request);
+      return;
+    }
 
 #endif
 
@@ -2425,8 +2872,11 @@ namespace gmd::bridge::detail
     fallback_available = fallback_available ||
                          (
                            g_member_get_names.load( std::memory_order_acquire ) &&
-                           g_member_names_count.load( std::memory_order_acquire ) &&
-                           g_variable_name_from_slot.load( std::memory_order_acquire )
+                           g_variable_name_from_slot.load( std::memory_order_acquire ) &&
+                           (
+                             g_member_names_count.load( std::memory_order_acquire ) ||
+                             g_member_dictionary_iterator.load( std::memory_order_acquire )
+                           )
                          );
 
 #endif
@@ -3196,16 +3646,17 @@ std::uint32_t gmd_configure_member_fallback(void* get_names, void* names_count)
 {
   clear_error();
 
-  if ( !get_names || !names_count )
+  if (!get_names)
   {
-    set_error( "Member-name fallback requires get-names & count routines" );
+    set_error( "Member-name fallback requires a get-names routine" );
     return 0;
   }
 
   g_member_get_names.store( reinterpret_cast< Routine >( get_names ), std::memory_order_release );
   g_member_names_count.store( reinterpret_cast< Routine >( names_count ), std::memory_order_release );
 
-  const auto legacy_helpers = g_yy_get_string.load( std::memory_order_acquire ) &&
+  const auto legacy_helpers = names_count &&
+                              g_yy_get_string.load( std::memory_order_acquire ) &&
                               g_free_rvalue.load( std::memory_order_acquire ) &&
                               g_find_variable_slot.load( std::memory_order_acquire );
 
@@ -3213,7 +3664,7 @@ std::uint32_t gmd_configure_member_fallback(void* get_names, void* names_count)
 
 #if !defined(_WIN64)
 
-  dictionary_helpers = discover_x86_member_dictionary( reinterpret_cast<Routine>(get_names) );
+  dictionary_helpers = discover_x86_member_dictionary( reinterpret_cast< Routine >( get_names ), reinterpret_cast< Routine >( names_count ) );
 
 #endif
 
